@@ -1,4 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Header, Response
+from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -6,7 +7,9 @@ from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
+import json
 import os
+import uuid
 
 import question_bank
 import models
@@ -15,6 +18,43 @@ from database import engine, get_db
 app = FastAPI()
 
 models.Base.metadata.create_all(bind=engine)
+
+
+def _migrate_add_company_column(target_engine=engine):
+    """SQLite create_all은 기존 테이블에 컬럼을 추가하지 못하므로,
+    interview_sessions에 company 컬럼이 없으면 직접 추가한다.
+    실패해도 서버 기동은 막지 않는다."""
+    try:
+        from sqlalchemy import text
+        with target_engine.begin() as conn:
+            cols = conn.execute(text("PRAGMA table_info(interview_sessions)")).fetchall()
+            col_names = [c[1] for c in cols]
+            if cols and "company" not in col_names:
+                conn.execute(text("ALTER TABLE interview_sessions ADD COLUMN company TEXT"))
+                print("[마이그레이션] interview_sessions.company 컬럼 추가 완료")
+    except Exception as e:
+        print(f"[마이그레이션 경고] company 컬럼 추가 실패 (서버는 계속 뜸): {e}")
+
+
+def _migrate_add_career_column(target_engine=engine):
+    """analysis_jobs에 career 컬럼이 없으면 직접 추가한다.
+    (경력자 평가 개선 — 워커가 신입/경력 프롬프트를 분기하는 데 사용)
+    실패해도 서버 기동은 막지 않는다."""
+    try:
+        from sqlalchemy import text
+        with target_engine.begin() as conn:
+            cols = conn.execute(text("PRAGMA table_info(analysis_jobs)")).fetchall()
+            col_names = [c[1] for c in cols]
+            if cols and "career" not in col_names:
+                conn.execute(text(
+                    "ALTER TABLE analysis_jobs ADD COLUMN career TEXT DEFAULT '신입'"))
+                print("[마이그레이션] analysis_jobs.career 컬럼 추가 완료")
+    except Exception as e:
+        print(f"[마이그레이션 경고] career 컬럼 추가 실패 (서버는 계속 뜸): {e}")
+
+
+_migrate_add_company_column()
+_migrate_add_career_column()
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -130,23 +170,175 @@ def make_questions(req: QuestionRequest):
     return {"job_role": job_role, "level": req.level, "career": req.career, "questions": questions}
 
 
+# ════════════════════════════════════════════════════════
+#  영상 분석 작업 큐 (배포 서버 ↔ PC GPU 워커 폴링 구조)
+#  - 프론트: POST /api/analyze-answer 로 영상 업로드 → job_id 받고
+#            GET /api/analysis-result/{job_id} 를 폴링
+#  - 워커:   GET /worker/next-job → GET /worker/video/{id} →
+#            POST /worker/result/{id}
+# ════════════════════════════════════════════════════════
+
+# 영상 저장 폴더 (환경변수 VIDEO_DIR로 변경 가능, 예: /home/ubuntu/videos)
+VIDEO_DIR = os.environ.get("VIDEO_DIR", "videos")
+
+# 워커 인증 키 (서버 환경변수 WORKER_KEY로 교체할 것)
+WORKER_KEY = os.environ.get("WORKER_KEY", "coachcoach-worker-dev-key")
+
+# processing 상태로 이 시간(분)을 넘기면 워커가 죽은 것으로 보고 pending 복구
+STUCK_JOB_MINUTES = 10
+
+
+def verify_worker_key(x_worker_key: str = Header(None)):
+    if x_worker_key != WORKER_KEY:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="워커 인증 키가 올바르지 않습니다.")
+
+
+def _delete_job_video(job: "models.AnalysisJob"):
+    """분석이 끝난 영상 파일을 디스크에서 지운다 (무료 서버 디스크 보호)."""
+    if job.video_path:
+        try:
+            if os.path.exists(job.video_path):
+                os.remove(job.video_path)
+        except Exception as e:
+            print(f"[작업큐] 영상 삭제 실패 (job {job.id}): {e}")
+
+
 @app.post("/api/analyze-answer")
 async def analyze_answer(
     video: UploadFile = File(...),
     question: str = Form(...),
     job_role: str = Form("일반 직무"),
+    career: str = Form("신입"),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    # AWS 배포 버전에서는 분석기가 꺼져 있다.
-    # (분석은 내 PC 워커가 담당 — 3단계에서 연결 예정)
-    if analyzer is None:
-        return {"error": "이 서버에서는 영상 분석이 비활성화되어 있습니다. (분석은 PC 워커 담당)"}
+    # 영상을 서버 디스크에 저장하고 작업 큐에 등록한다.
+    # 실제 분석은 내 PC의 GPU 워커가 /worker/* API로 가져가서 처리한다.
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+    ext = os.path.splitext(video.filename or "")[1] or ".webm"
+    video_path = os.path.join(VIDEO_DIR, f"{uuid.uuid4().hex}{ext}")
+
     video_bytes = await video.read()
-    try:
-        result = analyzer.analyze(video_bytes, question=question, job_role=job_role)
-        return result
-    except Exception as e:
-        print(f"[분석 오류] {e}")
-        return {"error": f"분석 중 오류가 발생했습니다: {e}"}
+    with open(video_path, "wb") as f:
+        f.write(video_bytes)
+
+    job = models.AnalysisJob(
+        user_id=current_user.user_id,
+        question=question,
+        job_role=job_role,
+        career=career,
+        video_path=video_path,
+        status="pending",
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return {"job_id": job.id, "status": "pending"}
+
+
+@app.get("/api/analysis-result/{job_id}")
+def get_analysis_result(job_id: int,
+                        current_user: models.User = Depends(get_current_user),
+                        db: Session = Depends(get_db)):
+    # 프론트가 폴링하는 엔드포인트. 본인 job만 조회 가능.
+    job = (db.query(models.AnalysisJob)
+           .filter(models.AnalysisJob.id == job_id,
+                   models.AnalysisJob.user_id == current_user.user_id)
+           .first())
+    if job is None:
+        raise HTTPException(status_code=404, detail="해당 분석 작업을 찾을 수 없습니다.")
+
+    result = None
+    if job.status == "done" and job.result_json:
+        try:
+            result = json.loads(job.result_json)
+        except Exception:
+            result = None
+    return {"status": job.status, "result": result, "error": job.error}
+
+
+@app.get("/worker/next-job")
+def worker_next_job(db: Session = Depends(get_db),
+                    _=Depends(verify_worker_key)):
+    # 1) 오래 물고 있는(stuck) processing job 복구
+    cutoff = datetime.utcnow() - timedelta(minutes=STUCK_JOB_MINUTES)
+    stuck_jobs = (db.query(models.AnalysisJob)
+                  .filter(models.AnalysisJob.status == "processing")
+                  .all())
+    recovered = False
+    for sj in stuck_jobs:
+        started = sj.processing_started_at
+        if started is not None and started.tzinfo is not None:
+            started = started.replace(tzinfo=None)
+        if started is None or started < cutoff:
+            sj.status = "pending"
+            sj.processing_started_at = None
+            recovered = True
+    if recovered:
+        db.commit()
+
+    # 2) pending 중 가장 오래된 job 1개를 워커에게 배정
+    job = (db.query(models.AnalysisJob)
+           .filter(models.AnalysisJob.status == "pending")
+           .order_by(models.AnalysisJob.id.asc())
+           .first())
+    if job is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    job.status = "processing"
+    job.processing_started_at = datetime.utcnow()
+    db.commit()
+    db.refresh(job)
+    return {
+        "job_id": job.id,
+        "question": job.question,
+        "job_role": job.job_role,
+        "career": job.career or "신입",
+        "video_url": f"/worker/video/{job.id}",
+    }
+
+
+@app.get("/worker/video/{job_id}")
+def worker_get_video(job_id: int,
+                     db: Session = Depends(get_db),
+                     _=Depends(verify_worker_key)):
+    job = db.query(models.AnalysisJob).filter(models.AnalysisJob.id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="해당 작업이 없습니다.")
+    if not job.video_path or not os.path.exists(job.video_path):
+        raise HTTPException(status_code=404, detail="영상 파일이 없습니다.")
+    return FileResponse(job.video_path, media_type="application/octet-stream",
+                        filename=os.path.basename(job.video_path))
+
+
+class WorkerResult(BaseModel):
+    ok: bool
+    result: dict | None = None
+    error: str | None = None
+
+
+@app.post("/worker/result/{job_id}")
+def worker_post_result(job_id: int,
+                       payload: WorkerResult,
+                       db: Session = Depends(get_db),
+                       _=Depends(verify_worker_key)):
+    job = db.query(models.AnalysisJob).filter(models.AnalysisJob.id == job_id).first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="해당 작업이 없습니다.")
+
+    if payload.ok:
+        job.status = "done"
+        job.result_json = json.dumps(payload.result or {}, ensure_ascii=False)
+        job.error = None
+    else:
+        job.status = "failed"
+        job.error = payload.error or "워커에서 알 수 없는 오류가 발생했습니다."
+    db.commit()
+
+    # 분석이 끝났으니 영상은 즉시 삭제 (디스크 보호)
+    _delete_job_video(job)
+    return {"message": "결과 저장 완료", "job_id": job.id, "status": job.status}
 
 
 # ════════════════════════════════════════════════════════
@@ -218,6 +410,7 @@ class ResultIn(BaseModel):
 class SessionIn(BaseModel):
     job: str = ""
     sub_job: str = ""
+    company: str | None = None   # 지원 회사 (선택, 없거나 빈 문자열이면 null 저장)
     level: str = "중"
     results: list[ResultIn] = []
 
@@ -234,10 +427,13 @@ def finish_interview(payload: SessionIn,
         posture_avg = content_avg = 0
     total = round((posture_avg + content_avg) / 2)
 
+    company = (payload.company or "").strip() or None  # 빈 문자열이면 null 저장
+
     session = models.InterviewSession(
         user_id=current_user.user_id,
         job=payload.job,
         sub_job=payload.sub_job,
+        company=company,
         level=payload.level,
         posture_score=posture_avg,
         content_score=content_avg,
@@ -280,6 +476,7 @@ def get_history(current_user: models.User = Depends(get_current_user),
         "session_id": s.session_id,
         "job": s.job,
         "sub_job": s.sub_job,
+        "company": s.company,
         "level": s.level,
         "posture_score": s.posture_score,
         "content_score": s.content_score,
@@ -344,6 +541,7 @@ def get_history_detail(session_id: int,
             "session_id": session.session_id,
             "job": session.job,
             "sub_job": session.sub_job,
+            "company": session.company,
             "level": session.level,
             "posture_score": session.posture_score,
             "content_score": session.content_score,

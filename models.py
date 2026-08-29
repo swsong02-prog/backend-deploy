@@ -26,6 +26,7 @@ class InterviewSession(Base):
     user_id = Column(Integer, ForeignKey("users.user_id"))            # 어느 회원의 면접인지
     job = Column(String)                                             # 직무 분야 (예: 개발)
     sub_job = Column(String)                                         # 세부 직무 (예: 백엔드)
+    company = Column(String, nullable=True)                          # 지원 회사 (예: 삼성전자, 없으면 null)
     level = Column(String)                                           # 난이도 (하/중/상)
     posture_score = Column(Integer)                                  # 자세·표정 종합 점수
     content_score = Column(Integer)                                  # 답변 내용 종합 점수
@@ -35,6 +36,23 @@ class InterviewSession(Base):
     # 위로는 회원, 아래로는 문항 결과들과 연결
     user = relationship("User", back_populates="sessions")
     results = relationship("QuestionResult", back_populates="session")
+
+
+# 영상 분석 작업 큐 (배포 서버 ↔ PC GPU 워커 폴링 구조)
+class AnalysisJob(Base):
+    __tablename__ = "analysis_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)        # 작업 고유번호
+    user_id = Column(Integer, ForeignKey("users.user_id"))    # 누가 올린 영상인지
+    question = Column(Text)                                   # 면접 질문
+    job_role = Column(String)                                 # 직무 (예: 개발 백엔드)
+    career = Column(String, default="신입")                    # 신입/경력 구분 (워커 평가 프롬프트 분기용)
+    video_path = Column(String)                               # 서버 디스크에 저장된 영상 경로
+    status = Column(String, default="pending", index=True)    # pending / processing / done / failed
+    result_json = Column(Text, nullable=True)                 # 워커가 보낸 분석 결과(JSON 문자열)
+    error = Column(Text, nullable=True)                       # 실패 시 오류 메시지
+    created_at = Column(DateTime(timezone=True), server_default=func.now())  # 작업 생성 일시
+    processing_started_at = Column(DateTime(timezone=True), nullable=True)   # 워커가 가져간 시각(stuck 복구용)
 
 
 # 설계 문서의 question_results 테이블 (문항 1개 = 1줄)
