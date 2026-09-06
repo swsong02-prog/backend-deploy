@@ -5,11 +5,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 import json
 import os
 import uuid
+import hashlib
+import io
+import zipfile
+import xml.etree.ElementTree as ET
+from collections import OrderedDict
 
 import question_bank
 import models
@@ -55,6 +60,25 @@ def _migrate_add_career_column(target_engine=engine):
 
 _migrate_add_company_column()
 _migrate_add_career_column()
+
+
+def _utc_iso(dt):
+    """DB created_at(SQLite func.now() → UTC, tz 정보 없는 naive datetime)을
+    UTC 명시 ISO 문자열('...Z')로 변환한다. 프론트의 new Date()가 로컬 시각으로
+    올바르게 변환하도록 하기 위함(9시간 오차 방지)."""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except ValueError:
+            return dt
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -161,7 +185,7 @@ def make_questions(req: QuestionRequest):
         print(f"[경고] 질문 생성 오류, 기본 질문 대체: {e}")
         questions = [
             "간단하게 자기소개를 해주세요.",
-            "우리 회사(또는 이 직무)에 지원하신 동기는 무엇인가요?",
+            "지원하신 곳(회사·기관)과 이 직무에 지원하신 동기는 무엇인가요?",
             "본인의 가장 큰 강점은 무엇인가요?",
             "지원한 직무에 본인이 적합하다고 생각하는 이유는 무엇인가요?",
             "최근에 어려운 문제를 해결했던 경험을 말해주세요.",
@@ -481,7 +505,7 @@ def get_history(current_user: models.User = Depends(get_current_user),
         "posture_score": s.posture_score,
         "content_score": s.content_score,
         "total_score": s.total_score,
-        "created_at": s.created_at,
+        "created_at": _utc_iso(s.created_at),
     } for s in sessions]
 
 
@@ -504,7 +528,7 @@ def get_growth(current_user: models.User = Depends(get_current_user),
             "posture_score": s.posture_score,
             "content_score": s.content_score,
             "total_score": s.total_score,
-            "created_at": s.created_at,
+            "created_at": _utc_iso(s.created_at),
         })
 
     improvement = None
@@ -546,7 +570,7 @@ def get_history_detail(session_id: int,
             "posture_score": session.posture_score,
             "content_score": session.content_score,
             "total_score": session.total_score,
-            "created_at": session.created_at,
+            "created_at": _utc_iso(session.created_at),
         },
         "results": [{
             "result_id": r.result_id,
@@ -560,3 +584,146 @@ def get_history_detail(session_id: int,
             "filler_count": r.filler_count,
         } for r in results],
     }
+
+
+# ════════════════════════════════════════════════════════
+#  자소서 파일 업로드 파싱
+# ════════════════════════════════════════════════════════
+RESUME_MAX_FILE_BYTES = 5 * 1024 * 1024   # 5MB
+RESUME_MAX_TEXT_CHARS = 10_000
+RESUME_EMPTY_TEXT_MSG = "파일에서 텍스트를 찾지 못했어요. 내용을 직접 붙여넣어 주세요."
+
+
+def _extract_text_from_txt(data: bytes) -> str:
+    for enc in ("utf-8", "cp949"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(RESUME_EMPTY_TEXT_MSG)
+
+
+def _extract_text_from_docx(data: bytes) -> str:
+    # .docx는 zip 압축 파일 — 표준 라이브러리만으로 word/document.xml에서 텍스트 추출
+    W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            xml_bytes = zf.read("word/document.xml")
+        root = ET.fromstring(xml_bytes)
+    except (zipfile.BadZipFile, KeyError, ET.ParseError):
+        raise ValueError(RESUME_EMPTY_TEXT_MSG)
+
+    paragraphs = []
+    for p in root.iter(f"{W_NS}p"):
+        parts = []
+        for node in p.iter():
+            if node.tag == f"{W_NS}t" and node.text:
+                parts.append(node.text)
+            elif node.tag in (f"{W_NS}tab",):
+                parts.append("\t")
+            elif node.tag in (f"{W_NS}br", f"{W_NS}cr"):
+                parts.append("\n")
+        paragraphs.append("".join(parts))
+    return "\n".join(paragraphs)
+
+
+def _extract_text_from_pdf(data: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        raise ValueError("PDF는 지원 준비 중이에요. txt 또는 docx 파일을 이용해 주세요.")
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        pages = [(page.extract_text() or "") for page in reader.pages]
+    except Exception:
+        raise ValueError(RESUME_EMPTY_TEXT_MSG)
+    return "\n".join(pages)
+
+
+def extract_resume_text(filename: str, data: bytes) -> str:
+    """업로드된 자소서 파일(bytes)에서 텍스트를 추출해 정리(공백 제거, 10,000자 절단)해서 반환.
+
+    실패 시 사용자에게 보여줄 한국어 메시지를 담은 ValueError를 던진다.
+    """
+    name = (filename or "").lower()
+    if name.endswith(".txt"):
+        text = _extract_text_from_txt(data)
+    elif name.endswith(".docx"):
+        text = _extract_text_from_docx(data)
+    elif name.endswith(".pdf"):
+        text = _extract_text_from_pdf(data)
+    else:
+        raise ValueError("지원하지 않는 파일 형식이에요. txt, docx, pdf 파일만 올려주세요.")
+
+    text = text.strip()
+    if not text:
+        raise ValueError(RESUME_EMPTY_TEXT_MSG)
+    return text[:RESUME_MAX_TEXT_CHARS]
+
+
+@app.post("/api/parse-resume")
+async def parse_resume(file: UploadFile = File(...),
+                       current_user: models.User = Depends(get_current_user)):
+    data = await file.read()
+    if len(data) > RESUME_MAX_FILE_BYTES:
+        raise HTTPException(status_code=400,
+                            detail="파일이 너무 커요. 5MB 이하 파일만 올려주세요.")
+    try:
+        text = extract_resume_text(file.filename or "", data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"text": text, "filename": file.filename, "chars": len(text)}
+
+
+# ════════════════════════════════════════════════════════
+#  면접 질문 음성 합성 (MS 뉴럴 음성 — 브라우저 TTS보다 자연스러움)
+# ════════════════════════════════════════════════════════
+TTS_VOICE = "ko-KR-SunHiNeural"   # 또렷한 여성 — 발주자 청음 후 확정 (2026-09-05)
+TTS_RATE = "-5%"                   # 살짝 느리게 — 면접관 톤
+TTS_MAX_TEXT_CHARS = 500
+TTS_CACHE_MAX = 100
+
+# 같은 질문을 여러 번 읽는 경우가 많아 text 해시로 mp3를 캐싱 (오래된 것부터 제거)
+_tts_cache: "OrderedDict[str, bytes]" = OrderedDict()
+
+
+class TTSRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/tts")
+async def synthesize_speech(req: TTSRequest,
+                            current_user: models.User = Depends(get_current_user)):
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="읽을 텍스트가 비어 있어요.")
+    if len(text) > TTS_MAX_TEXT_CHARS:
+        raise HTTPException(status_code=400,
+                            detail=f"텍스트가 너무 길어요. {TTS_MAX_TEXT_CHARS}자 이하로 보내주세요.")
+
+    key = hashlib.sha256(f"{TTS_VOICE}|{TTS_RATE}|{text}".encode("utf-8")).hexdigest()
+    cached = _tts_cache.get(key)
+    if cached is not None:
+        _tts_cache.move_to_end(key)  # 최근 사용으로 갱신
+        return Response(content=cached, media_type="audio/mpeg")
+
+    try:
+        import edge_tts
+        communicate = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
+        chunks = []
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                chunks.append(chunk["data"])
+        audio = b"".join(chunks)
+        if not audio:
+            raise RuntimeError("빈 오디오 응답")
+    except Exception as e:
+        # 오프라인 등 네트워크 실패 — 프론트가 브라우저 TTS로 폴백할 수 있게 503
+        print(f"[TTS 오류] {e}")
+        raise HTTPException(status_code=503, detail="음성 생성에 실패했어요")
+
+    _tts_cache[key] = audio
+    while len(_tts_cache) > TTS_CACHE_MAX:
+        _tts_cache.popitem(last=False)  # 가장 오래된 항목 제거
+
+    return Response(content=audio, media_type="audio/mpeg")

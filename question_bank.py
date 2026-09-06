@@ -6,12 +6,13 @@ question_bank.py — 직무별 + 난이도별 + 신입/경력 면접 질문 은�
 from __future__ import annotations
 
 import os
+import re
 import json
 import random
 
-# 고정 질문 (1번 자기소개, 2번 지원동기)
+# 고정 질문 (1번 자기소개, 2번 지원동기) — 직군 중립 문구(회사·기관·공직 모두 해당)
 INTRO_QUESTION = "간단하게 자기소개를 해주세요."
-MOTIVE_QUESTION = "우리 회사(또는 이 직무)에 지원하신 동기는 무엇인가요?"
+MOTIVE_QUESTION = "지원하신 곳(회사·기관)과 이 직무에 지원하신 동기는 무엇인가요?"
 
 LEVELS = ("하", "중", "상")
 LEVEL_DESC = {
@@ -50,7 +51,7 @@ CAREER_COMMON = {
         "이직(또는 지원)을 결심하게 된 이유는 무엇인가요?",
         "현재(또는 이전) 회사에서 본인의 주된 책임은 무엇이었나요?",
         "본인의 경력 중 가장 자신 있는 분야는 무엇인가요?",
-        "우리 회사에서 본인의 경험을 어떻게 활용할 수 있다고 보시나요?",
+        "지원하신 곳에서 본인의 경험을 어떻게 활용할 수 있다고 보시나요?",
     ],
     "중": [
         "최근에 진행한 프로젝트를 하나 골라, 본인의 역할과 기여를 구체적으로 말씀해주세요.",
@@ -578,6 +579,136 @@ def _compose_career(career_pool, job_pool, n):
     return questions[:n]
 
 
+# ════════════════════════════════════════════════════════
+#  모델 출력 검증 게이트
+#  규칙: 모델이 만든 질문은 검증 없이 절대 사용자에게 내보내지 않는다.
+#   ① 한자·가나(CJK) 포함 → 드롭   ② JSON 조각·프롬프트 누출 → 드롭
+#   ③ 15자 미만 / 물음표(또는 '~해주세요'류 존댓말 요청형) 없음 → 드롭
+#   ④ 반말 종결 → 드롭            ⑤ 중복 → 드롭
+#   ⑥ 부족분은 정적 질문은행에서 보충해 항상 요청 개수(n)를 보장
+# ════════════════════════════════════════════════════════
+# content_evaluator._CJK_PATTERN 과 동일한 정규식 (한자·히라가나·가타카나)
+_CJK_PATTERN = re.compile("[%s-%s%s-%s%s-%s%s-%s]" % tuple(
+    chr(c) for c in (0x3040, 0x30FF,    # 히라가나·가타카나
+                     0x3400, 0x4DBF,    # 한자 확장 A
+                     0x4E00, 0x9FFF,    # 한자 기본
+                     0xF900, 0xFAFF)))  # 호환 한자
+# JSON 조각·프롬프트 누출 흔적 (중괄호·대괄호·백틱·키 이름·플레이스홀더 등)
+_LEAK_PATTERN = re.compile(
+    r"[{}\[\]`<>]|questions|json|翻译|질문\s*\d|\\n|\\\"|http", re.IGNORECASE
+)
+# 존댓말 의문형 종결: ~요? / ~죠? / ~니까?
+_POLITE_QUESTION_END = re.compile(r"(요|죠|니까)\s*[?？]$")
+# 존댓말 요청형 종결: ~해주세요. / ~말씀해 보세요. / ~설명해 주십시오.
+_POLITE_REQUEST_END = re.compile(
+    r"(주세요|보세요|주십시오|십시오|바랍니다|부탁드립니다|주시겠어요|주시겠습니까)\s*[.。]?$"
+)
+# 반말 종결 (명시적 드롭 목록): ~나? ~가? ~지? ~인가? ~봤나? ~니? ~냐? ~어? ~까? ~는가? ~는지?
+_BANMAL_END = re.compile(
+    r"(?<![요죠])(나|가|지|니|냐|어|아|는가|던가|는지|을지|ㄹ지)\s*[?？]$"
+    r"|(?<!니)까\s*[?？]$"                    # ~할까? (단, ~습니까? 는 존댓말)
+    r"|(해라|해봐|해|봐|자|해봐라)\s*[.。]?$"
+    r"|(?<!니)다\s*[.。]?$"                   # ~한다. (단, ~습니다/바랍니다 는 존댓말)
+)
+_LEADING_MARK = re.compile(r"^\s*(?:\d+\s*[.)]|[-•*·]|[Qq]\d*\s*[.:)])\s*")
+
+
+def _dedupe_key(q: str) -> str:
+    return re.sub(r"[\s\W_]", "", q)
+
+
+def _is_polite_ending(q: str) -> bool:
+    if _BANMAL_END.search(q):
+        return False
+    return bool(_POLITE_QUESTION_END.search(q) or _POLITE_REQUEST_END.search(q))
+
+
+def _sanitize_questions(raw_qs, exclude=()):
+    """모델 출력 리스트를 검증해 '한국어 존댓말 질문'만 남긴다. (순서 유지, 중복 제거)"""
+    seen = {_dedupe_key(q) for q in exclude}
+    out = []
+    for item in raw_qs or []:
+        if not isinstance(item, str):
+            continue
+        q = _LEADING_MARK.sub("", item.strip())
+        q = re.sub(r"\s+", " ", q).strip().strip('"\'“”‘’ ').strip()
+        if not q:
+            continue
+        if _CJK_PATTERN.search(q):            # ① 한자·가나 혼입
+            continue
+        if _LEAK_PATTERN.search(q):           # ② JSON 조각·프롬프트 누출
+            continue
+        core = re.sub(r"\s", "", q)
+        if len(core) < 15 or len(core) > 300:  # ③ 너무 짧거나(15자 미만) 비정상적으로 김
+            continue
+        if not re.search(r"[가-힣]", q):      # 한글이 전혀 없음
+            continue
+        if not _is_polite_ending(q):          # ③ 물음표/요청형 없음 · ④ 반말
+            continue
+        key = _dedupe_key(q)
+        if key in seen:                       # ⑤ 중복
+            continue
+        seen.add(key)
+        out.append(q)
+    return out
+
+
+def _bank_pool(job_role: str, level: str, is_career: bool, group: str = None):
+    """보충용 정적 질문 풀. 직무군·난이도 우선, 그다음 다른 난이도·공통 순."""
+    matched = group if (group is not None and group in JOB_GROUPS) else _match_group(job_role)
+    tiers = []
+    first = []
+    if is_career:
+        first.extend(CAREER_COMMON[level])
+    if matched:
+        first.extend(JOB_GROUPS[matched][level])
+    first.extend(COMMON_BY_LEVEL[level])
+    tiers.append(first)
+    rest = []
+    for lv in LEVELS:
+        if lv == level:
+            continue
+        if matched:
+            rest.extend(JOB_GROUPS[matched][lv])
+        rest.extend(COMMON_BY_LEVEL[lv])
+        if is_career:
+            rest.extend(CAREER_COMMON[lv])
+    tiers.append(rest)
+    return tiers
+
+
+def _finalize_questions(model_qs, n: int, job_role: str, level: str,
+                        is_career: bool, group: str = None):
+    """검증 게이트 통과분 + 정적 은행 보충 → [자기소개, 지원동기, ...] 정확히 n개."""
+    fixed = [INTRO_QUESTION, MOTIVE_QUESTION]
+    good = _sanitize_questions(model_qs, exclude=fixed)
+    dropped = len(model_qs or []) - len(good)
+    if dropped:
+        print(f"[검증] 모델 질문 {dropped}개 드롭(외국어·누출·짧음·반말·중복).")
+    questions = fixed + good[: max(0, n - 2)]
+    if len(questions) < n:
+        seen = {_dedupe_key(q) for q in questions}
+        for tier in _bank_pool(job_role, level, is_career, group):
+            pool = [q for q in tier if _dedupe_key(q) not in seen]
+            random.shuffle(pool)
+            for q in pool:
+                if len(questions) >= n:
+                    break
+                questions.append(q)
+                seen.add(_dedupe_key(q))
+            if len(questions) >= n:
+                break
+        print(f"[검증] 정적 질문은행에서 {n - 2 - len(good[:n - 2])}개 보충.")
+    return questions[:n]
+
+
+_LANGUAGE_RULES = """- 반드시 한국어(한글)로만 작성합니다. 한자·중국어·일본어·영어 등 다른 언어의 문자는 단 한 글자도 쓰지 마세요.
+- 모든 질문은 존댓말로 끝냅니다. (예: '~인가요?', '~해주세요.', '~있으신가요?', '~하셨습니까?')
+  반말 종결('~인가?', '~했나?', '~지?', '~봤나?')은 절대 금지입니다.
+- 각 질문은 15자 이상의 완전한 한 문장이며, 물음표(?)로 끝나는 질문형으로 씁니다.
+- 질문 문장 안에 번호, 따옴표, 중괄호, 설명 문구를 넣지 마세요."""
+
+
 def _generate_with_ollama(job_role: str, level: str, n: int, is_career: bool = False):
     try:
         import ollama
@@ -603,7 +734,7 @@ def _generate_with_ollama(job_role: str, level: str, n: int, is_career: bool = F
 이 직무·난이도에 맞는 면접 질문 {need}개를 만들어 주세요.
 
 규칙:
-- 모두 한국어로 작성합니다.
+{_LANGUAGE_RULES}
 - 자기소개·지원동기 같은 일반 질문은 제외하고 직무 특화 질문으로 만듭니다.
 - 아래 JSON 형식 하나만 출력하세요. 다른 텍스트 금지.
 
@@ -612,7 +743,10 @@ def _generate_with_ollama(job_role: str, level: str, n: int, is_career: bool = F
         resp = ollama.chat(
             model="qwen2.5:7b",
             messages=[
-                {"role": "system", "content": "당신은 한국어로만 답하는 전문 채용 면접관입니다."},
+                {"role": "system", "content": (
+                    "당신은 한국어로만 답하는 전문 채용 면접관입니다. "
+                    "출력의 모든 글자는 한글이어야 하며, 한자·중국어·일본어·영어 문자는 절대 쓰지 않습니다. "
+                    "모든 질문은 존댓말('~인가요?', '~해주세요', '~있으신가요?')로 끝냅니다.")},
                 {"role": "user", "content": prompt},
             ],
             format="json",
@@ -624,7 +758,8 @@ def _generate_with_ollama(job_role: str, level: str, n: int, is_career: bool = F
         qs = [str(q).strip() for q in data.get("questions", []) if str(q).strip()]
         if not qs:
             return None
-        return [INTRO_QUESTION, MOTIVE_QUESTION] + qs[:need]
+        # ★ 검증 게이트: 외국어·누출·반말·중복 드롭 후 정적 은행으로 보충해 n개 보장
+        return _finalize_questions(qs, n, job_role, level, is_career)
     except Exception as e:
         print(f"[안내] AI 질문 생성 실패 → 공통 질문으로 진행합니다. (사유: {e})")
         return None
@@ -664,7 +799,8 @@ def read_resume(path: str) -> str:
         return ""
 
 
-def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int):
+def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int,
+                          is_career: bool = False):
     try:
         import ollama
     except Exception:
@@ -678,14 +814,22 @@ def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int):
         "중": "일반적인 신입 채용 수준",
         "상": "전공 지식과 깊은 사고를 요구하는 심화·압박 수준",
     }.get(level, "실무 수준")
+    if is_career:
+        career_hint = (
+            "\n\n[중요] 이 지원자는 '경력자'입니다. 신입용 질문이 아니라, 자소서에 적힌 실제 직무 경험을 깊게 "
+            "파는 질문으로 만드세요. 맡았던 업무와 역할, 진행한 프로젝트와 기여, 낸 성과(가능하면 수치), "
+            "기술적/업무적 의사결정, 문제 해결 경험, 팀 리딩 경험 등."
+        )
+    else:
+        career_hint = ""
     prompt = f"""당신은 '{job_role}' 직무의 면접관입니다. 아래는 지원자가 제출한 자기소개서입니다.
-이 자소서 내용을 근거로, 실제 면접관이 물어볼 법한 맞춤 면접 질문 {need}개를 만들어 주세요.
+이 자소서 내용을 근거로, 실제 면접관이 물어볼 법한 맞춤 면접 질문 {need}개를 만들어 주세요.{career_hint}
 
 [자기소개서]
 {text}
 
 [질문 생성 규칙]
-- 모두 한국어로만 작성합니다.
+{_LANGUAGE_RULES}
 - 자소서에 실제로 적힌 경험·역량을 구체적으로 파고드는 질문으로 만듭니다.
 - 난이도는 '{level}'({level_hint})에 맞춥니다.
 - 자기소개·지원동기처럼 일반 질문은 제외합니다.
@@ -696,7 +840,10 @@ def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int):
         resp = ollama.chat(
             model="qwen2.5:7b",
             messages=[
-                {"role": "system", "content": "당신은 한국어로만 말하는 전문 면접관입니다."},
+                {"role": "system", "content": (
+                    "당신은 한국어로만 말하는 전문 면접관입니다. "
+                    "출력의 모든 글자는 한글이어야 하며, 한자·중국어·일본어·영어 문자는 절대 쓰지 않습니다. "
+                    "모든 질문은 존댓말('~인가요?', '~해주세요', '~있으신가요?')로 끝냅니다.")},
                 {"role": "user", "content": prompt},
             ],
             format="json",
@@ -708,7 +855,8 @@ def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int):
         qs = [str(q).strip() for q in data.get("questions", []) if str(q).strip()]
         if not qs:
             return None
-        return [INTRO_QUESTION, MOTIVE_QUESTION] + qs[:need]
+        # ★ 검증 게이트: 외국어·누출·반말·중복 드롭 후 정적 은행으로 보충해 n개 보장
+        return _finalize_questions(qs, n, job_role, level, is_career)
     except Exception as e:
         print(f"[자소서] 질문 생성 실패 → 일반 질문으로 진행합니다. (사유: {e})")
         return None
@@ -717,9 +865,12 @@ def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int):
 def build_questions_from_resume(resume_text: str, job_role: str = "일반 직무",
                                 level: str = "중", n: int = 6, career: str = "신입"):
     level = _normalize_level(level)
+    is_career = str(career).strip() in ("경력", "경력자", "career")
     if resume_text and resume_text.strip():
-        print("[질문] 자소서를 분석해 맞춤 질문을 생성 중입니다...")
-        qs = _generate_from_resume(resume_text, job_role, level, n)
+        ctx = "경력자" if is_career else "신입"
+        print(f"[질문] 자소서를 분석해 맞춤 질문({ctx})을 생성 중입니다...")
+        qs = _generate_from_resume(resume_text, job_role, level, n,
+                                   is_career=is_career)
         if qs:
             print("[질문] 자소서 기반 맞춤 질문을 생성했습니다.")
             return qs[:n]
