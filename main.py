@@ -86,7 +86,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # 서버에 SECRET_KEY 환경변수가 있으면 그걸 쓰고, 없으면 (로컬 테스트용) 기본값을 쓴다.
 SECRET_KEY = os.environ.get("SECRET_KEY", "coachcoach-secret-key-change-this-later")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7일 — 60분 만료로 기록·피드백 화면이 죽던 문제 해결
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
