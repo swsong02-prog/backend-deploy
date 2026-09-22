@@ -55,6 +55,24 @@ class AnalysisJob(Base):
     processing_started_at = Column(DateTime(timezone=True), nullable=True)   # 워커가 가져간 시각(stuck 복구용)
 
 
+# 자소서 맞춤 질문 생성 작업 큐 (배포 서버엔 Ollama가 없어 PC 워커가 대신 생성)
+class QuestionJob(Base):
+    __tablename__ = "question_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)        # 작업 고유번호
+    user_id = Column(Integer, ForeignKey("users.user_id"), nullable=True)  # 토큰이 있을 때만 기록
+    job = Column(String)                                      # 직무 분야 (예: 개발)
+    sub = Column(String)                                      # 세부 직무 (예: 백엔드)
+    level = Column(String, default="중")                       # 난이도 (하/중/상)
+    career = Column(String, default="신입")                    # 신입/경력 구분
+    resume_text = Column(Text)                                # 자소서 본문
+    status = Column(String, default="pending", index=True)    # pending / processing / done / failed
+    result_json = Column(Text, nullable=True)                 # 워커가 보낸 질문 리스트(JSON 문자열)
+    error = Column(Text, nullable=True)                       # 실패 시 오류 메시지
+    created_at = Column(DateTime(timezone=True), server_default=func.now())  # 작업 생성 일시
+    processing_started_at = Column(DateTime(timezone=True), nullable=True)   # 워커가 가져간 시각(stuck 복구용)
+
+
 # 설계 문서의 question_results 테이블 (문항 1개 = 1줄)
 class QuestionResult(Base):
     __tablename__ = "question_results"

@@ -58,8 +58,40 @@ def _migrate_add_career_column(target_engine=engine):
         print(f"[마이그레이션 경고] career 컬럼 추가 실패 (서버는 계속 뜸): {e}")
 
 
+def _migrate_question_jobs_columns(target_engine=engine):
+    """question_jobs 테이블은 create_all이 만들지만, 이전 버전 테이블이 남아 있을 경우를
+    대비해 빠진 컬럼이 있으면 직접 추가한다. 실패해도 서버 기동은 막지 않는다."""
+    expected = {
+        "user_id": "INTEGER",
+        "job": "TEXT",
+        "sub": "TEXT",
+        "level": "TEXT DEFAULT '중'",
+        "career": "TEXT DEFAULT '신입'",
+        "resume_text": "TEXT",
+        "status": "TEXT DEFAULT 'pending'",
+        "result_json": "TEXT",
+        "error": "TEXT",
+        "created_at": "DATETIME",
+        "processing_started_at": "DATETIME",
+    }
+    try:
+        from sqlalchemy import text
+        with target_engine.begin() as conn:
+            cols = conn.execute(text("PRAGMA table_info(question_jobs)")).fetchall()
+            col_names = [c[1] for c in cols]
+            if not cols:
+                return
+            for name, ddl in expected.items():
+                if name not in col_names:
+                    conn.execute(text(f"ALTER TABLE question_jobs ADD COLUMN {name} {ddl}"))
+                    print(f"[마이그레이션] question_jobs.{name} 컬럼 추가 완료")
+    except Exception as e:
+        print(f"[마이그레이션 경고] question_jobs 컬럼 보강 실패 (서버는 계속 뜸): {e}")
+
+
 _migrate_add_company_column()
 _migrate_add_career_column()
+_migrate_question_jobs_columns()
 
 
 def _utc_iso(dt):
@@ -170,28 +202,97 @@ def get_jobs():
     return JOB_DATA
 
 
-@app.post("/api/questions")
-def make_questions(req: QuestionRequest):
-    job_role = f"{req.job} {req.sub}".strip()
+DEFAULT_QUESTIONS = [
+    "간단하게 자기소개를 해주세요.",
+    "지원하신 곳(회사·기관)과 이 직무에 지원하신 동기는 무엇인가요?",
+    "본인의 가장 큰 강점은 무엇인가요?",
+    "지원한 직무에 본인이 적합하다고 생각하는 이유는 무엇인가요?",
+    "최근에 어려운 문제를 해결했던 경험을 말해주세요.",
+    "5년 후 본인의 모습을 어떻게 그리고 있나요?",
+]
+
+
+def _bank_questions(job_role: str, level: str, career: str):
+    """정적 질문은행에서 6개를 뽑는다(배포 서버엔 Ollama가 없으므로 즉시 반환).
+    오류 시 기본 질문으로 대체."""
     try:
-        if req.resume_text and req.resume_text.strip():
-            questions = question_bank.build_questions_from_resume(
-                req.resume_text, job_role=job_role, level=req.level,
-                n=6, career=req.career)
-        else:
-            questions = question_bank.build_questions(
-                job_role=job_role, level=req.level, n=6, career=req.career)
+        return question_bank.build_questions(
+            job_role=job_role, level=level, n=6, career=career)
     except Exception as e:
         print(f"[경고] 질문 생성 오류, 기본 질문 대체: {e}")
-        questions = [
-            "간단하게 자기소개를 해주세요.",
-            "지원하신 곳(회사·기관)과 이 직무에 지원하신 동기는 무엇인가요?",
-            "본인의 가장 큰 강점은 무엇인가요?",
-            "지원한 직무에 본인이 적합하다고 생각하는 이유는 무엇인가요?",
-            "최근에 어려운 문제를 해결했던 경험을 말해주세요.",
-            "5년 후 본인의 모습을 어떻게 그리고 있나요?",
-        ]
-    return {"job_role": job_role, "level": req.level, "career": req.career, "questions": questions}
+        return list(DEFAULT_QUESTIONS)
+
+
+def _optional_user_id(authorization: str | None, db: Session) -> int | None:
+    """Authorization 헤더가 있고 유효하면 user_id, 아니면 None (인증 강제 안 함)."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            return None
+        user = db.query(models.User).filter(models.User.user_id == int(user_id)).first()
+        return user.user_id if user else None
+    except (JWTError, ValueError):
+        return None
+
+
+@app.post("/api/questions")
+def make_questions(req: QuestionRequest,
+                   authorization: str | None = Header(None),
+                   db: Session = Depends(get_db)):
+    """질문 생성.
+    - resume_text 없음 → 기존처럼 질문은행 6개 즉시 반환
+    - resume_text 있음 + 워커 온라인 → question_jobs에 등록하고 {job_id, status} 반환
+      (프론트는 GET /api/question-result/{job_id} 폴링)
+    - resume_text 있음 + 워커 오프라인(최근 5분 하트비트 없음) → 무한 대기 방지를 위해
+      질문은행 6개 즉시 반환
+    """
+    job_role = f"{req.job} {req.sub}".strip()
+    resume_text = (req.resume_text or "").strip()
+
+    if not resume_text:
+        questions = _bank_questions(job_role, req.level, req.career)
+        return {"job_role": job_role, "level": req.level, "career": req.career,
+                "questions": questions}
+
+    if not _worker_online():
+        print("[질문] 워커 오프라인 → 자소서 질문 대신 질문은행으로 즉시 응답")
+        questions = _bank_questions(job_role, req.level, req.career)
+        return {"job_role": job_role, "level": req.level, "career": req.career,
+                "questions": questions, "fallback": "worker_offline"}
+
+    qjob = models.QuestionJob(
+        user_id=_optional_user_id(authorization, db),
+        job=req.job,
+        sub=req.sub,
+        level=req.level,
+        career=req.career,
+        resume_text=resume_text[:RESUME_MAX_TEXT_CHARS],
+        status="pending",
+    )
+    db.add(qjob)
+    db.commit()
+    db.refresh(qjob)
+    return {"job_id": qjob.id, "status": "pending"}
+
+
+@app.get("/api/question-result/{job_id}")
+def get_question_result(job_id: int, db: Session = Depends(get_db)):
+    """프론트가 폴링하는 엔드포인트(타임아웃 60초 — 워커 처리 목표 15초 내)."""
+    qjob = db.query(models.QuestionJob).filter(models.QuestionJob.id == job_id).first()
+    if qjob is None:
+        raise HTTPException(status_code=404, detail="해당 질문 생성 작업을 찾을 수 없습니다.")
+
+    questions = None
+    if qjob.status == "done" and qjob.result_json:
+        try:
+            questions = json.loads(qjob.result_json)
+        except Exception:
+            questions = None
+    return {"status": qjob.status, "questions": questions, "error": qjob.error}
 
 
 # ════════════════════════════════════════════════════════
@@ -210,12 +311,36 @@ WORKER_KEY = os.environ.get("WORKER_KEY", "coachcoach-worker-dev-key")
 
 # processing 상태로 이 시간(분)을 넘기면 워커가 죽은 것으로 보고 pending 복구
 STUCK_JOB_MINUTES = 10
+# 질문 생성 job은 짧으므로 2분 넘게 processing이면 pending 복구
+STUCK_QUESTION_JOB_MINUTES = 2
+
+# ── 워커 하트비트: 워커가 /worker/next-job·/worker/next-question-job을 폴링할 때마다 갱신.
+#    최근 5분 내 폴링이 없으면 오프라인으로 보고 자소서 질문은 질문은행으로 즉시 폴백한다.
+WORKER_ONLINE_MINUTES = 5
+_worker_last_seen: datetime | None = None
+
+
+def _touch_worker():
+    global _worker_last_seen
+    _worker_last_seen = datetime.now(timezone.utc)
+
+
+def _worker_online() -> bool:
+    if _worker_last_seen is None:
+        return False
+    return datetime.now(timezone.utc) - _worker_last_seen < timedelta(minutes=WORKER_ONLINE_MINUTES)
 
 
 def verify_worker_key(x_worker_key: str = Header(None)):
     if x_worker_key != WORKER_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="워커 인증 키가 올바르지 않습니다.")
+
+
+@app.get("/api/worker-status")
+def worker_status():
+    """프론트가 '맞춤 질문 가능' 표시에 사용."""
+    return {"online": _worker_online(), "last_seen": _utc_iso(_worker_last_seen)}
 
 
 def _delete_job_video(job: "models.AnalysisJob"):
@@ -285,6 +410,7 @@ def get_analysis_result(job_id: int,
 @app.get("/worker/next-job")
 def worker_next_job(db: Session = Depends(get_db),
                     _=Depends(verify_worker_key)):
+    _touch_worker()  # 하트비트 갱신
     # 1) 오래 물고 있는(stuck) processing job 복구
     cutoff = datetime.utcnow() - timedelta(minutes=STUCK_JOB_MINUTES)
     stuck_jobs = (db.query(models.AnalysisJob)
@@ -363,6 +489,81 @@ def worker_post_result(job_id: int,
     # 분석이 끝났으니 영상은 즉시 삭제 (디스크 보호)
     _delete_job_video(job)
     return {"message": "결과 저장 완료", "job_id": job.id, "status": job.status}
+
+
+# ════════════════════════════════════════════════════════
+#  자소서 맞춤 질문 생성 작업 큐 (배포 서버 ↔ PC 워커, Ollama는 워커에만 있음)
+#  - 프론트: POST /api/questions(resume_text 포함) → job_id 받고
+#            GET /api/question-result/{job_id} 를 폴링
+#  - 워커:   GET /worker/next-question-job → POST /worker/question-result/{id}
+# ════════════════════════════════════════════════════════
+@app.get("/worker/next-question-job")
+def worker_next_question_job(db: Session = Depends(get_db),
+                             _=Depends(verify_worker_key)):
+    _touch_worker()  # 하트비트 갱신
+    # 1) 2분 넘게 processing인 job은 pending 복구
+    cutoff = datetime.utcnow() - timedelta(minutes=STUCK_QUESTION_JOB_MINUTES)
+    stuck = (db.query(models.QuestionJob)
+             .filter(models.QuestionJob.status == "processing")
+             .all())
+    recovered = False
+    for sj in stuck:
+        started = sj.processing_started_at
+        if started is not None and started.tzinfo is not None:
+            started = started.replace(tzinfo=None)
+        if started is None or started < cutoff:
+            sj.status = "pending"
+            sj.processing_started_at = None
+            recovered = True
+    if recovered:
+        db.commit()
+
+    # 2) pending 중 가장 오래된 job 1개 배정
+    qjob = (db.query(models.QuestionJob)
+            .filter(models.QuestionJob.status == "pending")
+            .order_by(models.QuestionJob.id.asc())
+            .first())
+    if qjob is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    qjob.status = "processing"
+    qjob.processing_started_at = datetime.utcnow()
+    db.commit()
+    db.refresh(qjob)
+    return {
+        "job_id": qjob.id,
+        "job": qjob.job or "",
+        "sub": qjob.sub or "",
+        "level": qjob.level or "중",
+        "career": qjob.career or "신입",
+        "resume_text": qjob.resume_text or "",
+    }
+
+
+class WorkerQuestionResult(BaseModel):
+    ok: bool
+    questions: list[str] | None = None
+    error: str | None = None
+
+
+@app.post("/worker/question-result/{job_id}")
+def worker_post_question_result(job_id: int,
+                                payload: WorkerQuestionResult,
+                                db: Session = Depends(get_db),
+                                _=Depends(verify_worker_key)):
+    qjob = db.query(models.QuestionJob).filter(models.QuestionJob.id == job_id).first()
+    if qjob is None:
+        raise HTTPException(status_code=404, detail="해당 작업이 없습니다.")
+
+    if payload.ok and payload.questions:
+        qjob.status = "done"
+        qjob.result_json = json.dumps(list(payload.questions), ensure_ascii=False)
+        qjob.error = None
+    else:
+        qjob.status = "failed"
+        qjob.error = payload.error or "워커에서 질문을 생성하지 못했습니다."
+    db.commit()
+    return {"message": "결과 저장 완료", "job_id": qjob.id, "status": qjob.status}
 
 
 # ════════════════════════════════════════════════════════
