@@ -2,13 +2,15 @@ from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, sta
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
 import json
 import os
+import hmac
+import math
 import uuid
 import hashlib
 import io
@@ -37,6 +39,9 @@ def _migrate_add_company_column(target_engine=engine):
             if cols and "company" not in col_names:
                 conn.execute(text("ALTER TABLE interview_sessions ADD COLUMN company TEXT"))
                 print("[마이그레이션] interview_sessions.company 컬럼 추가 완료")
+            if cols and "career" not in col_names:
+                conn.execute(text("ALTER TABLE interview_sessions ADD COLUMN career TEXT"))
+                print("[마이그레이션] interview_sessions.career 컬럼 추가 완료")
     except Exception as e:
         print(f"[마이그레이션 경고] company 컬럼 추가 실패 (서버는 계속 뜸): {e}")
 
@@ -89,9 +94,26 @@ def _migrate_question_jobs_columns(target_engine=engine):
         print(f"[마이그레이션 경고] question_jobs 컬럼 보강 실패 (서버는 계속 뜸): {e}")
 
 
+def _migrate_add_claim_token_columns(target_engine=engine):
+    """analysis_jobs / question_jobs에 claim_token 컬럼이 없으면 추가한다.
+    (워커가 가져간 '이번 배정'의 결과만 받아들이기 위한 배정 토큰)
+    실패해도 서버 기동은 막지 않는다."""
+    try:
+        from sqlalchemy import text
+        with target_engine.begin() as conn:
+            for table in ("analysis_jobs", "question_jobs"):
+                cols = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+                if cols and "claim_token" not in [c[1] for c in cols]:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN claim_token TEXT"))
+                    print(f"[마이그레이션] {table}.claim_token 컬럼 추가 완료")
+    except Exception as e:
+        print(f"[마이그레이션 경고] claim_token 컬럼 추가 실패 (서버는 계속 뜸): {e}")
+
+
 _migrate_add_company_column()
 _migrate_add_career_column()
 _migrate_question_jobs_columns()
+_migrate_add_claim_token_columns()
 
 
 def _utc_iso(dt):
@@ -115,8 +137,25 @@ def _utc_iso(dt):
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ── 비밀키: 코드에 박지 않고 서버 환경변수에서 읽어온다 ──
-# 서버에 SECRET_KEY 환경변수가 있으면 그걸 쓰고, 없으면 (로컬 테스트용) 기본값을 쓴다.
-SECRET_KEY = os.environ.get("SECRET_KEY", "coachcoach-secret-key-change-this-later")
+# 기본값이 코드(공개 저장소)에 있으면 누구나 토큰을 위조할 수 있으므로,
+# 환경변수가 없으면 서버를 띄우지 않는다.
+# 로컬 테스트에서만 ALLOW_DEV_KEYS=1 로 개발용 키를 허용한다.
+_ALLOW_DEV_KEYS = os.environ.get("ALLOW_DEV_KEYS") == "1"
+
+
+def _required_secret(name: str, dev_default: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    if _ALLOW_DEV_KEYS:
+        print(f"[경고] {name} 환경변수가 없어 개발용 키를 사용합니다 (로컬 테스트 전용).")
+        return dev_default
+    raise RuntimeError(
+        f"{name} 환경변수가 설정되지 않았습니다. 서버에 충분히 긴 무작위 값을 설정하세요. "
+        f"(로컬 테스트라면 ALLOW_DEV_KEYS=1)")
+
+
+SECRET_KEY = _required_secret("SECRET_KEY", "coachcoach-local-dev-secret")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7일 — 60분 만료로 기록·피드백 화면이 죽던 문제 해결
 
@@ -258,6 +297,13 @@ def make_questions(req: QuestionRequest,
         return {"job_role": job_role, "level": req.level, "career": req.career,
                 "questions": questions}
 
+    # 자소서 기반 질문은 개인정보가 담기므로 로그인 사용자만 생성·조회할 수 있다
+    user_id = _optional_user_id(authorization, db)
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="자기소개서 맞춤 질문은 로그인 후 이용할 수 있어요.",
+                            headers={"WWW-Authenticate": "Bearer"})
+
     if not _worker_online():
         print("[질문] 워커 오프라인 → 자소서 질문 대신 질문은행으로 즉시 응답")
         questions = _bank_questions(job_role, req.level, req.career)
@@ -265,7 +311,7 @@ def make_questions(req: QuestionRequest,
                 "questions": questions, "fallback": "worker_offline"}
 
     qjob = models.QuestionJob(
-        user_id=_optional_user_id(authorization, db),
+        user_id=user_id,
         job=req.job,
         sub=req.sub,
         level=req.level,
@@ -280,9 +326,14 @@ def make_questions(req: QuestionRequest,
 
 
 @app.get("/api/question-result/{job_id}")
-def get_question_result(job_id: int, db: Session = Depends(get_db)):
-    """프론트가 폴링하는 엔드포인트(타임아웃 60초 — 워커 처리 목표 15초 내)."""
-    qjob = db.query(models.QuestionJob).filter(models.QuestionJob.id == job_id).first()
+def get_question_result(job_id: int,
+                        current_user: models.User = Depends(get_current_user),
+                        db: Session = Depends(get_db)):
+    """프론트가 폴링하는 엔드포인트(타임아웃 60초 — 워커 처리 목표 15초 내). 본인 job만 조회 가능."""
+    qjob = (db.query(models.QuestionJob)
+            .filter(models.QuestionJob.id == job_id,
+                    models.QuestionJob.user_id == current_user.user_id)
+            .first())
     if qjob is None:
         raise HTTPException(status_code=404, detail="해당 질문 생성 작업을 찾을 수 없습니다.")
 
@@ -306,13 +357,20 @@ def get_question_result(job_id: int, db: Session = Depends(get_db)):
 # 영상 저장 폴더 (환경변수 VIDEO_DIR로 변경 가능, 예: /home/ubuntu/videos)
 VIDEO_DIR = os.environ.get("VIDEO_DIR", "videos")
 
-# 워커 인증 키 (서버 환경변수 WORKER_KEY로 교체할 것)
-WORKER_KEY = os.environ.get("WORKER_KEY", "coachcoach-worker-dev-key")
+# 워커 인증 키 (서버 환경변수 WORKER_KEY 필수)
+WORKER_KEY = _required_secret("WORKER_KEY", "coachcoach-worker-dev-key")
+
+# 영상 업로드 상한 (답변 1개 = 보통 수십 MB 이하). 환경변수 MAX_VIDEO_MB로 변경 가능
+MAX_VIDEO_BYTES = int(os.environ.get("MAX_VIDEO_MB", "150")) * 1024 * 1024
+# 사용자 1명이 동시에 쌓아둘 수 있는 대기/처리 중 분석 작업 수 (면접 1회 = 최대 6문항 + 재시도 여유)
+MAX_ACTIVE_JOBS_PER_USER = 8
+# 완료되지 못한 채 남은 영상 파일을 정리하는 기준 (시간)
+STALE_VIDEO_HOURS = 6
 
 # processing 상태로 이 시간(분)을 넘기면 워커가 죽은 것으로 보고 pending 복구
 STUCK_JOB_MINUTES = 10
-# 질문 생성 job은 짧으므로 2분 넘게 processing이면 pending 복구
-STUCK_QUESTION_JOB_MINUTES = 2
+# 질문 생성 job은 짧지만 Ollama 모델 첫 로딩이 1~3분 걸릴 수 있어 5분 넘게 processing이면 pending 복구
+STUCK_QUESTION_JOB_MINUTES = 5
 
 # ── 워커 하트비트: 워커가 /worker/next-job·/worker/next-question-job을 폴링할 때마다 갱신.
 #    최근 5분 내 폴링이 없으면 오프라인으로 보고 자소서 질문은 질문은행으로 즉시 폴백한다.
@@ -325,22 +383,38 @@ def _touch_worker():
     _worker_last_seen = datetime.now(timezone.utc)
 
 
-def _worker_online() -> bool:
-    if _worker_last_seen is None:
-        return False
-    return datetime.now(timezone.utc) - _worker_last_seen < timedelta(minutes=WORKER_ONLINE_MINUTES)
+def _worker_online(db: Session | None = None) -> bool:
+    if _worker_last_seen is not None and \
+            datetime.now(timezone.utc) - _worker_last_seen < timedelta(minutes=WORKER_ONLINE_MINUTES):
+        return True
+    # 워커가 긴 영상을 분석하느라 폴링이 끊긴 경우: 복구 기준 안에 가져간 작업이 있으면 살아 있는 것으로 본다
+    if db is not None:
+        cutoff = datetime.utcnow() - timedelta(minutes=STUCK_JOB_MINUTES)
+        busy = (db.query(models.AnalysisJob.id)
+                .filter(models.AnalysisJob.status == "processing",
+                        models.AnalysisJob.processing_started_at >= cutoff)
+                .first())
+        return busy is not None
+    return False
 
 
 def verify_worker_key(x_worker_key: str = Header(None)):
-    if x_worker_key != WORKER_KEY:
+    if not x_worker_key or not hmac.compare_digest(x_worker_key.encode(), WORKER_KEY.encode()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
                             detail="워커 인증 키가 올바르지 않습니다.")
 
 
 @app.get("/api/worker-status")
-def worker_status():
+def worker_status(db: Session = Depends(get_db)):
     """프론트가 '맞춤 질문 가능' 표시에 사용."""
-    return {"online": _worker_online(), "last_seen": _utc_iso(_worker_last_seen)}
+    return {"online": _worker_online(db), "last_seen": _utc_iso(_worker_last_seen)}
+
+
+@app.post("/worker/heartbeat")
+def worker_heartbeat(_=Depends(verify_worker_key)):
+    """워커가 긴 분석 중에도 살아 있음을 알린다 (분석 스레드와 별도로 주기 호출)."""
+    _touch_worker()
+    return {"ok": True}
 
 
 def _delete_job_video(job: "models.AnalysisJob"):
@@ -351,6 +425,21 @@ def _delete_job_video(job: "models.AnalysisJob"):
                 os.remove(job.video_path)
         except Exception as e:
             print(f"[작업큐] 영상 삭제 실패 (job {job.id}): {e}")
+
+
+def _cleanup_stale_videos(db: Session):
+    """오래도록 끝나지 않은 작업의 영상을 지우고 실패 처리한다 (워커 장기 중단 시 디스크 보호)."""
+    cutoff = datetime.utcnow() - timedelta(hours=STALE_VIDEO_HOURS)
+    stale = (db.query(models.AnalysisJob)
+             .filter(models.AnalysisJob.status.in_(("pending", "processing")),
+                     models.AnalysisJob.created_at < cutoff)
+             .all())
+    for job in stale:
+        job.status = "failed"
+        job.error = "분석이 오래 지연되어 취소되었어요. 다시 답변해주세요."
+        _delete_job_video(job)
+    if stale:
+        db.commit()
 
 
 @app.post("/api/analyze-answer")
@@ -364,13 +453,48 @@ async def analyze_answer(
 ):
     # 영상을 서버 디스크에 저장하고 작업 큐에 등록한다.
     # 실제 분석은 내 PC의 GPU 워커가 /worker/* API로 가져가서 처리한다.
+    if not _worker_online(db):
+        # 워커가 꺼져 있으면 영상을 쌓아두지 않고 바로 알려준다 (사용자가 5분 기다리지 않게)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="지금은 AI 분석 서버가 꺼져 있어요. 잠시 후 다시 시도해주세요.")
+
+    _cleanup_stale_videos(db)  # 오래된 작업부터 정리해야 만료 작업이 상한을 영영 막지 않는다
+
+    active = (db.query(models.AnalysisJob)
+              .filter(models.AnalysisJob.user_id == current_user.user_id,
+                      models.AnalysisJob.status.in_(("pending", "processing")))
+              .count())
+    if active >= MAX_ACTIVE_JOBS_PER_USER:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                            detail="분석 대기 중인 답변이 너무 많아요. 이전 분석이 끝난 뒤 다시 시도해주세요.")
+
     os.makedirs(VIDEO_DIR, exist_ok=True)
-    ext = os.path.splitext(video.filename or "")[1] or ".webm"
+    ext = os.path.splitext(video.filename or "")[1].lower()
+    if ext not in (".webm", ".mp4", ".mkv", ".mov"):
+        ext = ".webm"
     video_path = os.path.join(VIDEO_DIR, f"{uuid.uuid4().hex}{ext}")
 
-    video_bytes = await video.read()
-    with open(video_path, "wb") as f:
-        f.write(video_bytes)
+    # 메모리에 한 번에 올리지 않고 1MB씩 디스크에 쓰면서 크기 상한을 검사한다
+    written = 0
+    try:
+        with open(video_path, "wb") as f:
+            while True:
+                chunk = await video.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_VIDEO_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"영상이 너무 커요. {MAX_VIDEO_BYTES // (1024 * 1024)}MB 이하로 답변해주세요.")
+                f.write(chunk)
+    except BaseException:
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        raise
+    if written == 0:
+        os.remove(video_path)
+        raise HTTPException(status_code=400, detail="녹화된 영상이 비어 있어요. 다시 답변해주세요.")
 
     job = models.AnalysisJob(
         user_id=current_user.user_id,
@@ -429,24 +553,51 @@ def worker_next_job(db: Session = Depends(get_db),
         db.commit()
 
     # 2) pending 중 가장 오래된 job 1개를 워커에게 배정
-    job = (db.query(models.AnalysisJob)
-           .filter(models.AnalysisJob.status == "pending")
-           .order_by(models.AnalysisJob.id.asc())
-           .first())
+    job = _claim_next(db, models.AnalysisJob)
     if job is None:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-    job.status = "processing"
-    job.processing_started_at = datetime.utcnow()
-    db.commit()
-    db.refresh(job)
     return {
         "job_id": job.id,
+        "claim_token": job.claim_token,
         "question": job.question,
         "job_role": job.job_role,
         "career": job.career or "신입",
         "video_url": f"/worker/video/{job.id}",
     }
+
+
+def _claim_next(db: Session, model):
+    """pending job 1개를 원자적으로 processing으로 바꾸고 배정 토큰을 붙여 반환한다.
+    여러 워커가 동시에 요청해도 조건부 UPDATE가 성공한 쪽만 job을 가져간다."""
+    for _ in range(5):
+        candidate = (db.query(model.id)
+                     .filter(model.status == "pending")
+                     .order_by(model.id.asc())
+                     .first())
+        if candidate is None:
+            return None
+        token = uuid.uuid4().hex
+        claimed = (db.query(model)
+                   .filter(model.id == candidate.id, model.status == "pending")
+                   .update({model.status: "processing",
+                            model.processing_started_at: datetime.utcnow(),
+                            model.claim_token: token},
+                           synchronize_session=False))
+        db.commit()
+        if claimed == 1:
+            return db.query(model).filter(model.id == candidate.id).first()
+    return None
+
+
+def _accept_result(job, claim_token: str | None):
+    """지금 배정(processing)된 결과만 받는다. 재배정 전 워커의 늦은 결과는 거절한다.
+    (구버전 워커는 claim_token을 보내지 않으므로, 그 경우엔 processing 상태만 확인)"""
+    if job.status != "processing":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="이미 처리되었거나 다시 대기열로 돌아간 작업입니다.")
+    if claim_token is not None and claim_token != job.claim_token:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="다른 워커에게 다시 배정된 작업입니다.")
 
 
 @app.get("/worker/video/{job_id}")
@@ -466,6 +617,14 @@ class WorkerResult(BaseModel):
     ok: bool
     result: dict | None = None
     error: str | None = None
+    claim_token: str | None = None
+
+
+def _clamp_score(v):
+    """점수는 0~100 정수로 맞춘다. 숫자가 아니면 None(측정 실패)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return max(0, min(100, round(v)))
 
 
 @app.post("/worker/result/{job_id}")
@@ -476,10 +635,15 @@ def worker_post_result(job_id: int,
     job = db.query(models.AnalysisJob).filter(models.AnalysisJob.id == job_id).first()
     if job is None:
         raise HTTPException(status_code=404, detail="해당 작업이 없습니다.")
+    _accept_result(job, payload.claim_token)
 
     if payload.ok:
+        result = dict(payload.result or {})
+        for k in ("posture_score", "content_score"):
+            if k in result:
+                result[k] = _clamp_score(result[k])
         job.status = "done"
-        job.result_json = json.dumps(payload.result or {}, ensure_ascii=False)
+        job.result_json = json.dumps(result, ensure_ascii=False)
         job.error = None
     else:
         job.status = "failed"
@@ -519,19 +683,12 @@ def worker_next_question_job(db: Session = Depends(get_db),
         db.commit()
 
     # 2) pending 중 가장 오래된 job 1개 배정
-    qjob = (db.query(models.QuestionJob)
-            .filter(models.QuestionJob.status == "pending")
-            .order_by(models.QuestionJob.id.asc())
-            .first())
+    qjob = _claim_next(db, models.QuestionJob)
     if qjob is None:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-    qjob.status = "processing"
-    qjob.processing_started_at = datetime.utcnow()
-    db.commit()
-    db.refresh(qjob)
     return {
         "job_id": qjob.id,
+        "claim_token": qjob.claim_token,
         "job": qjob.job or "",
         "sub": qjob.sub or "",
         "level": qjob.level or "중",
@@ -544,6 +701,7 @@ class WorkerQuestionResult(BaseModel):
     ok: bool
     questions: list[str] | None = None
     error: str | None = None
+    claim_token: str | None = None
 
 
 @app.post("/worker/question-result/{job_id}")
@@ -554,6 +712,7 @@ def worker_post_question_result(job_id: int,
     qjob = db.query(models.QuestionJob).filter(models.QuestionJob.id == job_id).first()
     if qjob is None:
         raise HTTPException(status_code=404, detail="해당 작업이 없습니다.")
+    _accept_result(qjob, payload.claim_token)
 
     if payload.ok and payload.questions:
         qjob.status = "done"
@@ -623,42 +782,51 @@ def read_me(current_user: models.User = Depends(get_current_user)):
 #  면접 결과 저장
 # ════════════════════════════════════════════════════════
 class ResultIn(BaseModel):
-    question: str = ""
-    answer_stt: str = ""
-    posture_score: int = 0
-    content_score: int = 0
-    feedback: str = ""
-    model_answer: str = ""
-    duration_sec: int = 0
-    filler_count: int = 0
+    question: str = Field("", max_length=1000)
+    answer_stt: str = Field("", max_length=20000)
+    posture_score: int | None = Field(None, ge=0, le=100)   # None = 측정 실패 (0점과 구분)
+    content_score: int | None = Field(None, ge=0, le=100)
+    feedback: str = Field("", max_length=20000)
+    model_answer: str = Field("", max_length=20000)
+    duration_sec: int = Field(0, ge=0, le=36000)
+    filler_count: int = Field(0, ge=0, le=10000)
 
 class SessionIn(BaseModel):
-    job: str = ""
-    sub_job: str = ""
-    company: str | None = None   # 지원 회사 (선택, 없거나 빈 문자열이면 null 저장)
-    level: str = "중"
-    results: list[ResultIn] = []
+    job: str = Field("", max_length=100)
+    sub_job: str = Field("", max_length=100)
+    company: str | None = Field(None, max_length=100)   # 지원 회사 (선택, 없거나 빈 문자열이면 null 저장)
+    level: str = Field("중", max_length=10)
+    career: str | None = Field(None, max_length=10)     # 신입/경력 (추천 '같은 조건' 복원용)
+    results: list[ResultIn] = Field(default_factory=list, max_length=30)
+
+
+def _avg(values):
+    """측정된 값(None 제외)만 평균. 하나도 없으면 None."""
+    vals = [v for v in values if v is not None]
+    # 파이썬 round()는 .5를 짝수로 보내므로(66.5→66) 프론트(Math.round, 66.5→67)와 맞게 반올림한다
+    return math.floor(sum(vals) / len(vals) + 0.5) if vals else None
 
 
 @app.post("/interview/finish")
 def finish_interview(payload: SessionIn,
                      current_user: models.User = Depends(get_current_user),
                      db: Session = Depends(get_db)):
-    n = len(payload.results)
-    if n > 0:
-        posture_avg = round(sum(r.posture_score for r in payload.results) / n)
-        content_avg = round(sum(r.content_score for r in payload.results) / n)
-    else:
-        posture_avg = content_avg = 0
-    total = round((posture_avg + content_avg) / 2)
+    if not payload.results:
+        raise HTTPException(status_code=400, detail="저장할 답변 결과가 없어요.")
+    # 측정 실패(None)는 0점으로 치지 않고 평균에서 뺀다 (결과 화면과 같은 기준)
+    posture_avg = _avg(r.posture_score for r in payload.results)
+    content_avg = _avg(r.content_score for r in payload.results)
+    total = _avg((posture_avg, content_avg))
 
     company = (payload.company or "").strip() or None  # 빈 문자열이면 null 저장
+    career = payload.career if payload.career in ("신입", "경력") else None
 
     session = models.InterviewSession(
         user_id=current_user.user_id,
         job=payload.job,
         sub_job=payload.sub_job,
         company=company,
+        career=career,
         level=payload.level,
         posture_score=posture_avg,
         content_score=content_avg,
@@ -702,6 +870,7 @@ def get_history(current_user: models.User = Depends(get_current_user),
         "job": s.job,
         "sub_job": s.sub_job,
         "company": s.company,
+        "career": s.career,
         "level": s.level,
         "posture_score": s.posture_score,
         "content_score": s.content_score,
@@ -734,10 +903,13 @@ def get_growth(current_user: models.User = Depends(get_current_user),
 
     improvement = None
     if len(points) >= 2:
+        def _diff(key):
+            a, b = points[0][key], points[-1][key]
+            return None if a is None or b is None else b - a
         improvement = {
-            "posture": points[-1]["posture_score"] - points[0]["posture_score"],
-            "content": points[-1]["content_score"] - points[0]["content_score"],
-            "total":   points[-1]["total_score"]   - points[0]["total_score"],
+            "posture": _diff("posture_score"),
+            "content": _diff("content_score"),
+            "total":   _diff("total_score"),
         }
 
     return {"count": len(points), "points": points, "improvement": improvement}
@@ -767,6 +939,7 @@ def get_history_detail(session_id: int,
             "job": session.job,
             "sub_job": session.sub_job,
             "company": session.company,
+            "career": session.career,
             "level": session.level,
             "posture_score": session.posture_score,
             "content_score": session.content_score,
@@ -792,6 +965,8 @@ def get_history_detail(session_id: int,
 # ════════════════════════════════════════════════════════
 RESUME_MAX_FILE_BYTES = 5 * 1024 * 1024   # 5MB
 RESUME_MAX_TEXT_CHARS = 10_000
+RESUME_MAX_XML_BYTES = 20 * 1024 * 1024   # docx 본문 XML 압축 해제 상한
+RESUME_MAX_PDF_PAGES = 30
 RESUME_EMPTY_TEXT_MSG = "파일에서 텍스트를 찾지 못했어요. 내용을 직접 붙여넣어 주세요."
 
 
@@ -809,7 +984,14 @@ def _extract_text_from_docx(data: bytes) -> str:
     W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            xml_bytes = zf.read("word/document.xml")
+            info = zf.getinfo("word/document.xml")
+            # 압축 폭탄 방지: 풀었을 때 크기를 먼저 확인하고, 실제로도 상한까지만 읽는다
+            if info.file_size > RESUME_MAX_XML_BYTES:
+                raise ValueError("파일 내용이 너무 커요. 내용을 직접 붙여넣어 주세요.")
+            with zf.open(info) as fp:
+                xml_bytes = fp.read(RESUME_MAX_XML_BYTES + 1)
+            if len(xml_bytes) > RESUME_MAX_XML_BYTES:
+                raise ValueError("파일 내용이 너무 커요. 내용을 직접 붙여넣어 주세요.")
         root = ET.fromstring(xml_bytes)
     except (zipfile.BadZipFile, KeyError, ET.ParseError):
         raise ValueError(RESUME_EMPTY_TEXT_MSG)
@@ -835,7 +1017,11 @@ def _extract_text_from_pdf(data: bytes) -> str:
         raise ValueError("PDF는 지원 준비 중이에요. txt 또는 docx 파일을 이용해 주세요.")
     try:
         reader = PdfReader(io.BytesIO(data))
+        if len(reader.pages) > RESUME_MAX_PDF_PAGES:
+            raise ValueError(f"PDF는 {RESUME_MAX_PDF_PAGES}쪽 이하만 올려주세요.")
         pages = [(page.extract_text() or "") for page in reader.pages]
+    except ValueError:
+        raise
     except Exception:
         raise ValueError(RESUME_EMPTY_TEXT_MSG)
     return "\n".join(pages)
@@ -865,7 +1051,7 @@ def extract_resume_text(filename: str, data: bytes) -> str:
 @app.post("/api/parse-resume")
 async def parse_resume(file: UploadFile = File(...),
                        current_user: models.User = Depends(get_current_user)):
-    data = await file.read()
+    data = await file.read(RESUME_MAX_FILE_BYTES + 1)  # 상한 넘게는 읽지 않는다
     if len(data) > RESUME_MAX_FILE_BYTES:
         raise HTTPException(status_code=400,
                             detail="파일이 너무 커요. 5MB 이하 파일만 올려주세요.")

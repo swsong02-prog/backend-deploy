@@ -41,8 +41,14 @@ backend-deploy/
 
 | 변수 | 설명 |
 |---|---|
-| `SECRET_KEY` | JWT 서명 키 (미설정 시 기본값) |
+| `SECRET_KEY` | JWT 서명 키 — **필수** (없으면 서버가 시작되지 않음) |
+| `WORKER_KEY` | GPU 워커 인증 키 — **필수** (워커의 `WORKER_KEY`와 같아야 함) |
 | `ALLOWED_ORIGINS` | CORS 허용 도메인 (미설정 시 전체 허용) |
+| `MAX_VIDEO_MB` | 답변 영상 업로드 상한 (기본 150) |
+| `ALLOW_DEV_KEYS` | `1`이면 위 두 키 없이 개발용 키로 실행 (로컬 테스트 전용, 서버에 설정 금지) |
+
+키는 충분히 긴 무작위 값으로 만드세요. 예: `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`
+`SECRET_KEY`를 바꾸면 기존 로그인 토큰은 모두 무효가 되어 다시 로그인해야 합니다.
 
 ---
 

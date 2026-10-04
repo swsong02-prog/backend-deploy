@@ -27,6 +27,7 @@ class InterviewSession(Base):
     job = Column(String)                                             # 직무 분야 (예: 개발)
     sub_job = Column(String)                                         # 세부 직무 (예: 백엔드)
     company = Column(String, nullable=True)                          # 지원 회사 (예: 삼성전자, 없으면 null)
+    career = Column(String, nullable=True)                           # 신입/경력 (없으면 null)
     level = Column(String)                                           # 난이도 (하/중/상)
     posture_score = Column(Integer)                                  # 자세·표정 종합 점수
     content_score = Column(Integer)                                  # 답변 내용 종합 점수
@@ -53,6 +54,7 @@ class AnalysisJob(Base):
     error = Column(Text, nullable=True)                       # 실패 시 오류 메시지
     created_at = Column(DateTime(timezone=True), server_default=func.now())  # 작업 생성 일시
     processing_started_at = Column(DateTime(timezone=True), nullable=True)   # 워커가 가져간 시각(stuck 복구용)
+    claim_token = Column(String, nullable=True)                              # 이번 배정 토큰(늦은 결과 거절용)
 
 
 # 자소서 맞춤 질문 생성 작업 큐 (배포 서버엔 Ollama가 없어 PC 워커가 대신 생성)
@@ -71,6 +73,7 @@ class QuestionJob(Base):
     error = Column(Text, nullable=True)                       # 실패 시 오류 메시지
     created_at = Column(DateTime(timezone=True), server_default=func.now())  # 작업 생성 일시
     processing_started_at = Column(DateTime(timezone=True), nullable=True)   # 워커가 가져간 시각(stuck 복구용)
+    claim_token = Column(String, nullable=True)                              # 이번 배정 토큰(늦은 결과 거절용)
 
 
 # 설계 문서의 question_results 테이블 (문항 1개 = 1줄)
