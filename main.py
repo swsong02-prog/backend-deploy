@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 from collections import OrderedDict
 
 import question_bank
+import job_postings
 import models
 from database import engine, get_db
 
@@ -435,6 +436,17 @@ def verify_worker_key(x_worker_key: str = Header(None)):
 def worker_status(db: Session = Depends(get_db)):
     """프론트가 '맞춤 질문 가능' 표시에 사용."""
     return {"online": _worker_online(db), "last_seen": _utc_iso(_worker_last_seen)}
+
+
+@app.get("/api/postings")
+def postings(job: str = "", sub: str = "", career: str = "", companies: str = "",
+             scope: str = "job", limit: int = 8):
+    """공공기관 채용공고(잡알리오) — 내 직무·관심 회사·대전충청 기준으로 골라 준다. 공개 데이터라 로그인 불필요."""
+    if scope not in ("job", "local", "company"):
+        scope = "job"
+    comps = [c.strip() for c in companies.split(",") if c.strip()][:5]
+    return job_postings.search(job=job[:30], sub=sub[:30], career=career[:5],
+                               companies=comps, scope=scope, limit=limit)
 
 
 @app.post("/worker/heartbeat")

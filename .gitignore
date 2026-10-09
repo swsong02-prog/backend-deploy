@@ -18,3 +18,6 @@ env/
 # 분석 모델 가중치 (무거움 — 서버엔 불필요)
 *.pt
 *.onnx
+
+postings_cache.json
+postings_cache.json.tmp
