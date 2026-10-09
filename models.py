@@ -55,6 +55,7 @@ class AnalysisJob(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())  # 작업 생성 일시
     processing_started_at = Column(DateTime(timezone=True), nullable=True)   # 워커가 가져간 시각(stuck 복구용)
     claim_token = Column(String, nullable=True)                              # 이번 배정 토큰(늦은 결과 거절용)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")  # 복구 횟수
 
 
 # 자소서 맞춤 질문 생성 작업 큐 (배포 서버엔 Ollama가 없어 PC 워커가 대신 생성)
@@ -74,6 +75,7 @@ class QuestionJob(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())  # 작업 생성 일시
     processing_started_at = Column(DateTime(timezone=True), nullable=True)   # 워커가 가져간 시각(stuck 복구용)
     claim_token = Column(String, nullable=True)                              # 이번 배정 토큰(늦은 결과 거절용)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")  # 복구 횟수
 
 
 # 설계 문서의 question_results 테이블 (문항 1개 = 1줄)

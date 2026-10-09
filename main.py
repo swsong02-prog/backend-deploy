@@ -4,6 +4,8 @@ from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, timezone
 from jose import jwt, JWTError
@@ -15,6 +17,7 @@ import uuid
 import hashlib
 import io
 import zipfile
+import zlib
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 
@@ -106,6 +109,9 @@ def _migrate_add_claim_token_columns(target_engine=engine):
                 if cols and "claim_token" not in [c[1] for c in cols]:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN claim_token TEXT"))
                     print(f"[마이그레이션] {table}.claim_token 컬럼 추가 완료")
+                if cols and "attempts" not in [c[1] for c in cols]:
+                    conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"))
     except Exception as e:
         print(f"[마이그레이션 경고] claim_token 컬럼 추가 실패 (서버는 계속 뜸): {e}")
 
@@ -262,6 +268,25 @@ def _bank_questions(job_role: str, level: str, career: str):
         return list(DEFAULT_QUESTIONS)
 
 
+def _complete_questions(raw, qjob):
+    questions = []
+    def add(items):
+        for q in items:
+            if isinstance(q, str):
+                q = q.strip()
+                if q and q not in questions:
+                    questions.append(q)
+            if len(questions) >= 6:
+                break
+    add(raw if isinstance(raw, list) else [])
+    if len(questions) < 6:
+        role = f"{qjob.job or ''} {qjob.sub or ''}".strip() or "일반 직무"
+        add(_bank_questions(role, qjob.level or "중", qjob.career or "신입"))
+    if len(questions) < 6:
+        add(DEFAULT_QUESTIONS)
+    return questions[:6]
+
+
 def _optional_user_id(authorization: str | None, db: Session) -> int | None:
     """Authorization 헤더가 있고 유효하면 user_id, 아니면 None (인증 강제 안 함)."""
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -343,6 +368,8 @@ def get_question_result(job_id: int,
             questions = json.loads(qjob.result_json)
         except Exception:
             questions = None
+    if qjob.status == "done":
+        questions = _complete_questions(questions, qjob)
     return {"status": qjob.status, "questions": questions, "error": qjob.error}
 
 
@@ -505,7 +532,12 @@ async def analyze_answer(
         status="pending",
     )
     db.add(job)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        _delete_job_video(job)
+        raise
     db.refresh(job)
     return {"job_id": job.id, "status": "pending"}
 
@@ -537,20 +569,7 @@ def worker_next_job(db: Session = Depends(get_db),
     _touch_worker()  # 하트비트 갱신
     # 1) 오래 물고 있는(stuck) processing job 복구
     cutoff = datetime.utcnow() - timedelta(minutes=STUCK_JOB_MINUTES)
-    stuck_jobs = (db.query(models.AnalysisJob)
-                  .filter(models.AnalysisJob.status == "processing")
-                  .all())
-    recovered = False
-    for sj in stuck_jobs:
-        started = sj.processing_started_at
-        if started is not None and started.tzinfo is not None:
-            started = started.replace(tzinfo=None)
-        if started is None or started < cutoff:
-            sj.status = "pending"
-            sj.processing_started_at = None
-            recovered = True
-    if recovered:
-        db.commit()
+    _recover_stuck(db, models.AnalysisJob, cutoff)
 
     # 2) pending 중 가장 오래된 job 1개를 워커에게 배정
     job = _claim_next(db, models.AnalysisJob)
@@ -589,15 +608,44 @@ def _claim_next(db: Session, model):
     return None
 
 
-def _accept_result(job, claim_token: str | None):
-    """지금 배정(processing)된 결과만 받는다. 재배정 전 워커의 늦은 결과는 거절한다.
-    (구버전 워커는 claim_token을 보내지 않으므로, 그 경우엔 processing 상태만 확인)"""
-    if job.status != "processing":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
-                            detail="이미 처리되었거나 다시 대기열로 돌아간 작업입니다.")
-    if claim_token is not None and claim_token != job.claim_token:
+def _recover_stuck(db: Session, model, cutoff):
+    """조회 이후 완료/재배정된 작업은 조건부 UPDATE로 보호한다."""
+    expired = or_(model.processing_started_at.is_(None),
+                  model.processing_started_at < cutoff)
+    stuck = db.query(model).filter(model.status == "processing", expired).all()
+    for job in stuck:
+        attempts = (job.attempts or 0) + 1
+        failed = attempts >= 3
+        updated = (db.query(model)
+                   .filter(model.id == job.id, model.status == "processing",
+                           (model.claim_token.is_(None) if job.claim_token is None
+                            else model.claim_token == job.claim_token), expired)
+                   .update({model.status: "failed" if failed else "pending",
+                            model.attempts: attempts,
+                            model.processing_started_at: None,
+                            model.claim_token: None,
+                            model.error: "작업이 3회 지연되어 실패했어요. 다시 시도해주세요." if failed else None},
+                           synchronize_session=False))
+        if updated and failed and model is models.AnalysisJob:
+            _delete_job_video(job)
+    if stuck:
+        db.commit()
+
+
+def _accept_result(db: Session, model, job_id: int, claim_token: str | None, values):
+    """현재 배정 토큰과 processing 상태가 모두 일치할 때만 저장한다."""
+    if not claim_token or not claim_token.strip():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail="다른 워커에게 다시 배정된 작업입니다.")
+    updated = (db.query(model)
+               .filter(model.id == job_id, model.status == "processing",
+                       model.claim_token == claim_token)
+               .update(values, synchronize_session=False))
+    if updated != 1:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="이미 처리되었거나 다시 대기열로 돌아간 작업입니다.")
+    db.commit()
 
 
 @app.get("/worker/video/{job_id}")
@@ -624,7 +672,19 @@ def _clamp_score(v):
     """점수는 0~100 정수로 맞춘다. 숫자가 아니면 None(측정 실패)."""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
     return max(0, min(100, round(v)))
+
+
+def _clean_numbers(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _clean_numbers(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean_numbers(v) for v in value]
+    return value
 
 
 @app.post("/worker/result/{job_id}")
@@ -635,20 +695,20 @@ def worker_post_result(job_id: int,
     job = db.query(models.AnalysisJob).filter(models.AnalysisJob.id == job_id).first()
     if job is None:
         raise HTTPException(status_code=404, detail="해당 작업이 없습니다.")
-    _accept_result(job, payload.claim_token)
 
     if payload.ok:
-        result = dict(payload.result or {})
+        result = _clean_numbers(dict(payload.result or {}))
         for k in ("posture_score", "content_score"):
             if k in result:
                 result[k] = _clamp_score(result[k])
-        job.status = "done"
-        job.result_json = json.dumps(result, ensure_ascii=False)
-        job.error = None
+        values = {models.AnalysisJob.status: "done",
+                  models.AnalysisJob.result_json: json.dumps(result, ensure_ascii=False, allow_nan=False),
+                  models.AnalysisJob.error: None}
     else:
-        job.status = "failed"
-        job.error = payload.error or "워커에서 알 수 없는 오류가 발생했습니다."
-    db.commit()
+        values = {models.AnalysisJob.status: "failed",
+                  models.AnalysisJob.error: payload.error or "워커에서 알 수 없는 오류가 발생했습니다."}
+    _accept_result(db, models.AnalysisJob, job_id, payload.claim_token, values)
+    db.refresh(job)
 
     # 분석이 끝났으니 영상은 즉시 삭제 (디스크 보호)
     _delete_job_video(job)
@@ -665,22 +725,9 @@ def worker_post_result(job_id: int,
 def worker_next_question_job(db: Session = Depends(get_db),
                              _=Depends(verify_worker_key)):
     _touch_worker()  # 하트비트 갱신
-    # 1) 2분 넘게 processing인 job은 pending 복구
+    # 1) 오래 물고 있는 processing job 복구
     cutoff = datetime.utcnow() - timedelta(minutes=STUCK_QUESTION_JOB_MINUTES)
-    stuck = (db.query(models.QuestionJob)
-             .filter(models.QuestionJob.status == "processing")
-             .all())
-    recovered = False
-    for sj in stuck:
-        started = sj.processing_started_at
-        if started is not None and started.tzinfo is not None:
-            started = started.replace(tzinfo=None)
-        if started is None or started < cutoff:
-            sj.status = "pending"
-            sj.processing_started_at = None
-            recovered = True
-    if recovered:
-        db.commit()
+    _recover_stuck(db, models.QuestionJob, cutoff)
 
     # 2) pending 중 가장 오래된 job 1개 배정
     qjob = _claim_next(db, models.QuestionJob)
@@ -712,16 +759,17 @@ def worker_post_question_result(job_id: int,
     qjob = db.query(models.QuestionJob).filter(models.QuestionJob.id == job_id).first()
     if qjob is None:
         raise HTTPException(status_code=404, detail="해당 작업이 없습니다.")
-    _accept_result(qjob, payload.claim_token)
 
-    if payload.ok and payload.questions:
-        qjob.status = "done"
-        qjob.result_json = json.dumps(list(payload.questions), ensure_ascii=False)
-        qjob.error = None
+    if payload.ok:
+        questions = _complete_questions(payload.questions, qjob)
+        values = {models.QuestionJob.status: "done",
+                  models.QuestionJob.result_json: json.dumps(questions, ensure_ascii=False, allow_nan=False),
+                  models.QuestionJob.error: None}
     else:
-        qjob.status = "failed"
-        qjob.error = payload.error or "워커에서 질문을 생성하지 못했습니다."
-    db.commit()
+        values = {models.QuestionJob.status: "failed",
+                  models.QuestionJob.error: payload.error or "워커에서 질문을 생성하지 못했습니다."}
+    _accept_result(db, models.QuestionJob, job_id, payload.claim_token, values)
+    db.refresh(qjob)
     return {"message": "결과 저장 완료", "job_id": qjob.id, "status": qjob.status}
 
 
@@ -741,7 +789,11 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
     hashed = pwd_context.hash(req.password)
     new_user = models.User(email=req.email, password_hash=hashed)
     db.add(new_user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="이미 가입된 이메일입니다.")
     db.refresh(new_user)
     return {"message": "회원가입 완료", "user_id": new_user.user_id, "email": new_user.email}
 
@@ -833,8 +885,7 @@ def finish_interview(payload: SessionIn,
         total_score=total,
     )
     db.add(session)
-    db.commit()
-    db.refresh(session)
+    db.flush()
 
     for r in payload.results:
         db.add(models.QuestionResult(
@@ -993,7 +1044,8 @@ def _extract_text_from_docx(data: bytes) -> str:
             if len(xml_bytes) > RESUME_MAX_XML_BYTES:
                 raise ValueError("파일 내용이 너무 커요. 내용을 직접 붙여넣어 주세요.")
         root = ET.fromstring(xml_bytes)
-    except (zipfile.BadZipFile, KeyError, ET.ParseError):
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, KeyError, ET.ParseError,
+            NotImplementedError, RuntimeError, OSError, EOFError, zlib.error):
         raise ValueError(RESUME_EMPTY_TEXT_MSG)
 
     paragraphs = []
