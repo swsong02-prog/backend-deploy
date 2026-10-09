@@ -12,6 +12,7 @@ class User(Base):
     user_id = Column(Integer, primary_key=True, index=True)   # 회원 고유번호
     email = Column(String, unique=True, index=True)           # 로그인 아이디(중복 금지)
     password_hash = Column(String)                            # 해싱된 비밀번호
+    name = Column(String, nullable=True)                      # 표시 이름(회원가입 때 입력, 예전 회원은 비어 있을 수 있음)
     created_at = Column(DateTime(timezone=True), server_default=func.now())  # 가입 일시
 
     # 이 회원의 면접 세션들과 연결(1:N)

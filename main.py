@@ -117,7 +117,21 @@ def _migrate_add_claim_token_columns(target_engine=engine):
         print(f"[마이그레이션 경고] claim_token 컬럼 추가 실패 (서버는 계속 뜸): {e}")
 
 
+def _migrate_add_user_name_column(target_engine=engine):
+    """users.name(표시 이름) 컬럼이 없으면 추가. 실패해도 서버 기동은 막지 않는다."""
+    try:
+        from sqlalchemy import text
+        with target_engine.begin() as conn:
+            cols = [c[1] for c in conn.execute(text("PRAGMA table_info(users)")).fetchall()]
+            if cols and "name" not in cols:
+                conn.execute(text("ALTER TABLE users ADD COLUMN name TEXT"))
+                print("[마이그레이션] users.name 컬럼 추가 완료")
+    except Exception as e:
+        print(f"[마이그레이션 경고] users.name 컬럼 추가 실패 (서버는 계속 뜸): {e}")
+
+
 _migrate_add_company_column()
+_migrate_add_user_name_column()
 _migrate_add_career_column()
 _migrate_question_jobs_columns()
 _migrate_add_claim_token_columns()
@@ -440,13 +454,13 @@ def worker_status(db: Session = Depends(get_db)):
 
 @app.get("/api/postings")
 def postings(job: str = "", sub: str = "", career: str = "", companies: str = "",
-             scope: str = "job", limit: int = 8):
+             scope: str = "job", limit: int = 8, region: str = ""):
     """공공기관 채용공고(잡알리오) — 내 직무·관심 회사·대전충청 기준으로 골라 준다. 공개 데이터라 로그인 불필요."""
-    if scope not in ("job", "local", "company"):
+    if scope not in ("job", "region", "local", "company"):
         scope = "job"
     comps = [c.strip() for c in companies.split(",") if c.strip()][:5]
     return job_postings.search(job=job[:30], sub=sub[:30], career=career[:5],
-                               companies=comps, scope=scope, limit=limit)
+                               companies=comps, scope=scope, limit=limit, region=region[:10])
 
 
 @app.post("/worker/heartbeat")
@@ -791,6 +805,17 @@ def worker_post_question_result(job_id: int,
 class SignupRequest(BaseModel):
     email: str
     password: str
+    name: str = ""
+
+
+def _clean_name(raw):
+    """표시 이름: 앞뒤 공백 제거, 연속 공백 하나로, 1~20자"""
+    name = " ".join(str(raw or "").split())
+    if not name:
+        raise HTTPException(status_code=400, detail="이름을 입력해주세요.")
+    if len(name) > 20:
+        raise HTTPException(status_code=400, detail="이름은 20자 이내로 입력해주세요.")
+    return name
 
 
 @app.post("/signup")
@@ -798,8 +823,9 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
     exists = db.query(models.User).filter(models.User.email == req.email).first()
     if exists:
         raise HTTPException(status_code=400, detail="이미 가입된 이메일입니다.")
+    name = _clean_name(req.name)
     hashed = pwd_context.hash(req.password)
-    new_user = models.User(email=req.email, password_hash=hashed)
+    new_user = models.User(email=req.email, password_hash=hashed, name=name)
     db.add(new_user)
     try:
         db.commit()
@@ -807,7 +833,7 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=400, detail="이미 가입된 이메일입니다.")
     db.refresh(new_user)
-    return {"message": "회원가입 완료", "user_id": new_user.user_id, "email": new_user.email}
+    return {"message": "회원가입 완료", "user_id": new_user.user_id, "email": new_user.email, "name": new_user.name}
 
 
 # ════════════════════════════════════════════════════════
@@ -830,7 +856,7 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {"sub": str(user.user_id), "email": user.email, "exp": expire}
     token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-    return {"access_token": token, "token_type": "bearer", "user_id": user.user_id}
+    return {"access_token": token, "token_type": "bearer", "user_id": user.user_id, "name": user.name}
 
 
 # ════════════════════════════════════════════════════════
@@ -839,7 +865,20 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
 @app.get("/me")
 def read_me(current_user: models.User = Depends(get_current_user)):
     return {"user_id": current_user.user_id, "email": current_user.email,
-            "created_at": current_user.created_at}
+            "name": current_user.name, "created_at": current_user.created_at}
+
+
+class NameUpdate(BaseModel):
+    name: str
+
+
+@app.patch("/me")
+def update_me(req: NameUpdate, current_user: models.User = Depends(get_current_user),
+              db: Session = Depends(get_db)):
+    """표시 이름 변경 (예전 회원이 설정 화면에서 이름을 처음 넣을 때도 사용)"""
+    current_user.name = _clean_name(req.name)
+    db.commit()
+    return {"user_id": current_user.user_id, "email": current_user.email, "name": current_user.name}
 
 
 # ════════════════════════════════════════════════════════

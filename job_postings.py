@@ -58,6 +58,20 @@ SUB_KEYWORDS = {
 
 LOCAL_REGIONS = ("대전", "세종", "충남", "충북")
 
+# 화면에서 고르는 지역 → 공고 데이터의 지역 표기 (전남·광주는 "전남광주"로 묶여 오기도 함)
+REGION_ALIASES = {
+    "대전·충청": ["대전", "세종", "충남", "충북"],
+    "광주·전남": ["전남광주", "광주", "전남"],
+}
+REGIONS = ["서울", "경기", "인천", "대전", "세종", "충남", "충북", "대전·충청", "부산", "대구", "울산",
+           "광주·전남", "전북", "경북", "경남", "강원", "제주"]
+
+
+def _region_tokens(region):
+    if not region or region == "전체":
+        return []
+    return REGION_ALIASES.get(region, [region])
+
 # 공고의 NCS 대분류 → '면접 연습' 눌렀을 때 미리 채울 우리 직군·세부직무
 NCS_TO_JOB = [
     ("정보통신", "개발", "백엔드"),
@@ -181,8 +195,11 @@ def _company_hit(inst_n, companies_n):
     return any(c and len(c) >= 2 and (c in inst_n or inst_n in c) for c in companies_n)
 
 
-def search(job="", sub="", career="", companies=(), scope="job", limit=8):
-    """scope: job(내 직무) | local(대전·충청) | company(관심 회사)"""
+def search(job="", sub="", career="", companies=(), scope="job", limit=8, region=""):
+    """scope: job(내 직무) | region(지역) | company(관심 회사). region: REGIONS 중 하나 또는 전체"""
+    if scope == "local":  # 예전 화면 호환
+        scope, region = "region", "대전·충청"
+    rtoks = _region_tokens(region)
     items, fetched_at, error, has_key = get_postings()
     ncs_want = set(JOB_TO_NCS.get(job, []))
     kws = SUB_KEYWORDS.get(sub, [])
@@ -202,11 +219,11 @@ def search(job="", sub="", career="", companies=(), scope="job", limit=8):
                     company_counts[c] += 1
         ncs_hit = bool(ncs_want.intersection(x["ncs"]))
         kw_hit = any(k.lower() in text.lower() for k in kws)
-        local = any(r in x["region"] for r in LOCAL_REGIONS)
+        local = bool(rtoks) and any(r in x["region"].split(",") for r in rtoks)
 
         if scope == "company" and not is_comp:
             continue
-        if scope == "local" and not local:
+        if scope == "region" and rtoks and not local:
             continue
         if scope == "job" and not (ncs_hit or kw_hit or is_comp):
             continue
@@ -226,7 +243,7 @@ def search(job="", sub="", career="", companies=(), scope="job", limit=8):
         dday = (end - today).days if end else None
         if dday is not None and dday <= 3:
             s += 3  # 곧 마감은 살짝 위로
-        tags = [t for t, ok in (("관심 회사", is_comp), ("내 직무", ncs_hit or kw_hit), ("대전·충청", local)) if ok]
+        tags = [t for t, ok in (("관심 회사", is_comp), ("내 직무", ncs_hit or kw_hit), (region or "지역", local)) if ok]
         sj, ss = _suggest_job(x["ncs"], job, sub, ncs_want)
         scored.append((s, dday if dday is not None else 999,
                        {**x, "dday": dday, "tags": tags, "suggest_job": sj, "suggest_sub": ss}))
@@ -241,4 +258,5 @@ def search(job="", sub="", career="", companies=(), scope="job", limit=8):
         "available": has_key and bool(items),
         "error": error if not items else None,
         "source": "잡알리오(재정경제부 공공기관 채용정보)",
+        "regions": REGIONS,
     }
