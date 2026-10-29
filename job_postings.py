@@ -23,6 +23,8 @@ CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "postings_
 # 우리 13개 직군 → 공공기관 공고의 NCS 대분류
 JOB_TO_NCS = {
     "개발": ["정보통신"],
+    "클라우드·인프라": ["정보통신"],
+    "정보보안": ["정보통신"],
     "데이터·AI": ["정보통신", "연구"],
     "디자인": ["문화.예술.디자인.방송"],
     "마케팅": ["경영.회계.사무", "영업판매", "문화.예술.디자인.방송"],
@@ -54,6 +56,38 @@ SUB_KEYWORDS = {
     "간호사": ["간호"], "약사": ["약사", "약제"], "보건직": ["보건"], "임상·검사": ["임상", "검사", "병리", "방사선"],
     "PD": ["방송", "영상", "PD"], "기자·에디터": ["홍보", "기자", "편집"], "영상·편집": ["영상", "편집"],
     "작가·기획": ["홍보", "콘텐츠", "기획"],
+    "풀스택": ["전산", "IT", "개발", "웹"], "게임 개발": ["게임"], "QA·테스트": ["품질", "시험", "테스트"],
+    "클라우드 엔지니어": ["클라우드", "전산", "인프라", "서버"], "클라우드 아키텍트": ["클라우드", "아키텍처", "인프라"],
+    "SRE": ["시스템", "운영", "인프라", "전산"], "시스템 엔지니어": ["시스템", "서버", "전산", "운영"],
+    "네트워크 엔지니어": ["네트워크", "통신", "정보통신"], "DBA": ["DB", "데이터베이스"],
+    "보안 관제": ["보안", "관제"], "모의해킹": ["보안", "해킹", "취약점"], "보안 컨설팅": ["보안", "컨설팅"],
+    "정보보호 관리": ["정보보호", "보안", "ISMS"], "클라우드 보안": ["보안", "클라우드"],
+    "개인정보보호": ["개인정보", "정보보호"],
+    "데이터 사이언티스트": ["데이터", "통계", "분석", "AI"], "AI 엔지니어(LLM)": ["AI", "인공지능", "LLM"],
+    "브랜드 디자인": ["디자인", "브랜드"], "웹 디자인": ["디자인", "웹"],
+    "CRM": ["고객", "CRM", "마케팅"], "홍보·PR": ["홍보", "언론", "대외협력"],
+    "기술영업": ["기술영업", "영업", "사업화"], "영업지원": ["영업", "지원"],
+    "법무": ["법무", "법률", "변호사", "계약"], "구매·자재": ["구매", "자재", "조달", "계약"],
+    "서비스 기획": ["기획", "서비스"], "사무·비서": ["사무", "비서", "행정"],
+    "핀테크": ["금융", "IT", "디지털"], "세무·회계사": ["세무", "회계사", "회계"],
+    "반도체": ["반도체"], "건축·토목": ["건축", "토목", "건설"], "생산·품질관리": ["생산", "품질"],
+    "환경·안전": ["환경", "안전", "보건관리"],
+    "기술직 공무원": ["기술", "시설", "전기", "기계", "토목"], "사회복지": ["사회복지", "복지"],
+    "유아·보육": ["보육", "유아", "어린이집"], "상담": ["상담", "심리"],
+    "방사선사": ["방사선"], "물리·작업치료": ["물리치료", "작업치료", "재활"], "영양사": ["영양", "조리"],
+    "의료행정": ["원무", "의무기록", "의료"],
+    "물류·SCM": ["물류", "유통", "운송"], "고객상담(CS)": ["상담", "고객", "콜센터"], "여행·관광": ["관광", "여행"],
+    "아나운서": ["아나운서", "방송"], "게임 기획": ["게임", "콘텐츠"],
+    # 탐색 화면에서 세부 직무를 고를 수 있게 나머지 세부직무도 단어를 붙여 둔다
+    "UI·UX": ["UI", "UX", "디자인"], "그래픽": ["디자인", "그래픽"], "제품 디자인": ["디자인", "제품"],
+    "영상·모션": ["영상", "모션"],
+    "브랜드": ["홍보", "브랜드"], "퍼포먼스": ["마케팅", "광고"], "콘텐츠": ["콘텐츠", "홍보"], "SNS": ["SNS", "홍보", "온라인"],
+    "B2B 영업": ["영업", "판로", "마케팅"], "B2C 영업": ["영업", "고객"], "해외영업": ["해외", "무역", "수출"],
+    "영업관리": ["영업", "판매"],
+    "은행": ["금융", "여신", "수신"], "증권·투자": ["투자", "증권", "자산운용"], "보험": ["보험"],
+    "리스크·심사": ["심사", "리스크", "신용", "보증"],
+    "승무원": ["승무", "객실"], "호텔": ["호텔", "숙박", "관광"], "판매·MD": ["판매", "MD", "유통"],
+    "외식·식음": ["조리", "급식", "영양", "식음"],
 }
 
 LOCAL_REGIONS = ("대전", "세종", "충남", "충북")
@@ -135,9 +169,22 @@ def _clean(raw):
         "end": raw.get("pbancEndYmd"),
         "end_date": end.isoformat() if end else None,
         "url": (raw.get("srcUrl") or "").strip(),
-        "qual": re.sub(r"\s+", " ", (raw.get("aplyQlfcCn") or "")).strip()[:600],
-        "pref": re.sub(r"\s+", " ", (raw.get("prefCondCn") or "")).strip()[:300],
+        "qual": _txt(raw.get("aplyQlfcCn"), 2000),
+        "pref": _txt(raw.get("prefCondCn"), 1000),
+        # 상세 화면용 (API에 없으면 빈 값 — 화면에서 해당 칸을 숨김)
+        "acbg": (raw.get("acbgCondNmLst") or "").strip(),
+        "steps": _txt(raw.get("scrnprcdrMthdExpln"), 1500),
+        "disqual": _txt(raw.get("disqlfcRsn"), 1000),
+        "replmpr": (raw.get("replmprYn") or "").strip() == "Y",
     }
+
+
+def _txt(v, n):
+    """공고 본문 칸: 줄바꿈은 살리고 연속 공백만 정리"""
+    s = str(v or "").replace("\r", "")
+    s = re.sub(r"[ \t\u00a0]+", " ", s)
+    s = re.sub(r"\n\s*\n+", "\n", s).strip()
+    return s[:n]
 
 
 def _fetch_all(key):
@@ -260,3 +307,157 @@ def search(job="", sub="", career="", companies=(), scope="job", limit=8, region
         "source": "잡알리오(재정경제부 공공기관 채용정보)",
         "regions": REGIONS,
     }
+
+
+# ───────────── 채용공고 탐색 화면 (잡코리아식 필터) ─────────────
+JOBS = list(JOB_TO_NCS.keys())
+HIRE_GROUPS = ["정규직", "무기계약직", "비정규직", "청년인턴"]
+SE_GROUPS = ["신입", "경력", "신입+경력"]
+SORTS = ("match", "deadline", "recent", "nope")
+
+
+# NCS 분류가 '정보통신' 하나로 겹치는 직군은 제목·자격요건 단어까지 맞아야 그 직군으로 센다
+JOB_REQUIRE_KW = {
+    "클라우드·인프라": ["클라우드", "인프라", "시스템", "서버", "네트워크", "전산", "데이터센터", "DB", "운영"],
+    "정보보안": ["보안", "정보보호", "개인정보", "관제", "침해", "해킹"],
+}
+
+
+def _in_job(x, job):
+    if not set(JOB_TO_NCS.get(job, [])).intersection(x["ncs"]):
+        return False
+    kws = JOB_REQUIRE_KW.get(job)
+    if not kws:
+        return True
+    text = (x["title"] + " " + x.get("qual", "")).lower()
+    return any(k.lower() in text for k in kws)
+
+
+def _in_sub(x, sub):
+    kws = SUB_KEYWORDS.get(sub, [])
+    text = (x["title"] + " " + x.get("qual", "")).lower()
+    return any(k.lower() in text for k in kws)
+
+
+def _in_region(x, regions):
+    if not regions:
+        return True
+    have = x["region"].split(",")
+    return any(t in have for r in regions for t in _region_tokens(r))
+
+
+def _in_hire(x, hires):
+    if not hires:
+        return True
+    have = x["hire"].split(",")
+    # "청년인턴(체험형)"·"청년인턴(채용형)"처럼 괄호가 붙어 오는 값도 묶어서 본다
+    return any(any(h == v or v.startswith(h) for v in have) for h in hires)
+
+
+def _in_se(x, ses):
+    return not ses or x["se"] in ses
+
+
+def _dday(x, today):
+    end = _parse_ymd(x.get("end"))
+    return (end - today).days if end else None
+
+
+def browse(jobs=(), subs=(), regions=(), hires=(), ses=(), q="", closing=0, sort="match",
+           page=1, size=20, career=""):
+    """필터 + 정렬 + 페이지 + 항목별 개수(facet).
+    facet 개수는 '그 항목만 빼고 나머지 필터를 걸었을 때' 개수 — 잡코리아처럼 눌렀을 때 몇 건 나올지 미리 보인다."""
+    items, fetched_at, error, has_key = get_postings()
+    today = date.today()
+    qn = (q or "").strip().lower()
+    jobs = [j for j in jobs if j in JOB_TO_NCS]
+    subs = [s for s in subs if s in SUB_KEYWORDS]
+    sort = sort if sort in SORTS else "match"
+
+    def ok(x, skip=None):
+        if skip != "job" and jobs and not any(_in_job(x, j) for j in jobs):
+            return False
+        if skip != "sub" and subs and not any(_in_sub(x, s) for s in subs):
+            return False
+        if skip != "region" and not _in_region(x, regions):
+            return False
+        if skip != "hire" and not _in_hire(x, hires):
+            return False
+        if skip != "se" and not _in_se(x, ses):
+            return False
+        if closing:
+            d = _dday(x, today)
+            if d is None or d > closing:
+                return False
+        if qn and qn not in (x["inst"] + " " + x["title"] + " " + x.get("qual", "")).lower():
+            return False
+        return True
+
+    facets = {
+        "job": {j: sum(1 for x in items if ok(x, "job") and _in_job(x, j)) for j in JOBS},
+        "region": {r: sum(1 for x in items if ok(x, "region") and _in_region(x, [r])) for r in REGIONS},
+        "hire": {h: sum(1 for x in items if ok(x, "hire") and _in_hire(x, [h])) for h in HIRE_GROUPS},
+        "se": {e: sum(1 for x in items if ok(x, "se") and x["se"] == e) for e in SE_GROUPS},
+    }
+    # 세부 직무 개수는 고른 직군 안에서만 의미가 있다
+    sub_pool = [x for x in items if ok(x, "sub")]
+    facets["sub"] = {s: sum(1 for x in sub_pool if _in_sub(x, s)) for s in SUB_KEYWORDS}
+
+    ncs_want = set(n for j in jobs for n in JOB_TO_NCS.get(j, []))
+    rows = []
+    for x in items:
+        if not ok(x):
+            continue
+        d = _dday(x, today)
+        s = 0
+        s += 30 if any(_in_job(x, j) for j in jobs) else 0
+        s += 10 if ncs_want and len(x["ncs"]) <= 2 else 0
+        s += 25 if subs and any(_in_sub(x, sb) for sb in subs) else 0
+        s += 6 if "정규직" in x["hire"].split(",") else 0
+        if career == "신입" and x["se"] == "경력":
+            s -= 40
+        if career == "경력" and x["se"] == "신입":
+            s -= 15
+        sj, ss = _suggest_job(x["ncs"], jobs[0] if jobs else "", subs[0] if subs else "", ncs_want)
+        rows.append((s, d, {**x, "dday": d, "suggest_job": sj, "suggest_sub": ss,
+                            "jobs": [j for j in JOBS if _in_job(x, j)][:3]}))
+
+    far = 9999
+    if sort == "deadline":
+        rows.sort(key=lambda t: (t[1] if t[1] is not None else far))
+    elif sort == "recent":
+        rows.sort(key=lambda t: str(t[2].get("start") or ""), reverse=True)
+    elif sort == "nope":
+        rows.sort(key=lambda t: -int(str(t[2].get("nope") or 0).strip() or 0) if str(t[2].get("nope") or "0").strip().isdigit() else 0)
+    else:
+        rows.sort(key=lambda t: (-t[0], t[1] if t[1] is not None else far))
+
+    size = max(5, min(int(size or 20), 50))
+    pages = max(1, (len(rows) + size - 1) // size)
+    page = max(1, min(int(page or 1), pages))
+    chunk = rows[(page - 1) * size: page * size]
+    return {
+        "items": [{k: v for k, v in t[2].items() if k not in ("disqual", "steps")} for t in chunk],
+        "total": len(rows),
+        "total_open": len(items),
+        "page": page, "pages": pages, "size": size,
+        "facets": facets,
+        "options": {"jobs": JOBS, "regions": REGIONS,
+                    "hires": HIRE_GROUPS, "ses": SE_GROUPS, "sorts": list(SORTS)},
+        "fetched_at": datetime.utcfromtimestamp(fetched_at).strftime("%Y-%m-%dT%H:%M:%SZ") if fetched_at else None,
+        "available": has_key and bool(items),
+        "error": error if not items else None,
+        "source": "잡알리오(재정경제부 공공기관 채용정보)",
+    }
+
+
+def detail(pid):
+    """공고 한 건 전체 (자격요건·우대·전형절차 원문 포함)"""
+    items, _, _, _ = get_postings()
+    today = date.today()
+    for x in items:
+        if str(x.get("id")) == str(pid):
+            sj, ss = _suggest_job(x["ncs"], "", "", set())
+            return {**x, "dday": _dday(x, today), "suggest_job": sj, "suggest_sub": ss,
+                    "jobs": [j for j in JOBS if _in_job(x, j)]}
+    return None
