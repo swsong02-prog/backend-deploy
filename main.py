@@ -1192,7 +1192,7 @@ async def parse_resume(file: UploadFile = File(...),
 # ════════════════════════════════════════════════════════
 #  면접 질문 음성 합성 (MS 뉴럴 음성 — 브라우저 TTS보다 자연스러움)
 # ════════════════════════════════════════════════════════
-TTS_VOICE = "ko-KR-SunHiNeural"   # 또렷한 여성 — 발주자 청음 후 확정 (2026-09-05)
+TTS_VOICE = "ko-KR-HyunsuMultilingualNeural"   # 차분한 남성 — 발주자 청음 후 확정 (2026-11-04), 이전: SunHiNeural
 TTS_RATE = "-5%"                   # 살짝 느리게 — 면접관 톤
 TTS_MAX_TEXT_CHARS = 500
 TTS_CACHE_MAX = 100
