@@ -179,6 +179,30 @@ def _clean(raw):
     }
 
 
+# 대전·충청권 지역인재 의무채용 공공기관 53곳 (대전시 "공공기관 목록 및 채용정보", 국토교통부 지정·고시 기준)
+# 대전·세종·충북·충남 소재 대학 졸업(예정)자는 이 기관들에서 지역인재로 인정된다 (충청권 광역화, 혁신도시법 시행령)
+# 출처: https://www.daejeon.go.kr/drh/DrhContentsHtmlView.do?menuSeq=6531
+LOCAL_TALENT_AGENCIES = {
+    "대전": "국가철도공단 국방과학연구소 코레일테크 한국가스기술공사 한국과학기술원 한국과학기술정보연구원 한국생명공학연구원 "
+            "한국수자원공사 한국원자력연구원 한국조폐공사 한국지질자원연구원 한국철도공사 한국특허정보원 한국한의학연구원 "
+            "한국화학연구원 한국등산트레킹지원센터 한국특허전략개발원 한국기상산업기술원",
+    "세종": "가축위생방역지원본부 경제인문사회연구회 과학기술정책연구원 국가과학기술연구회 국토연구원 농림수산식품교육문화정보원 "
+            "대외경제정책연구원 산업연구원 중소기업기술정보진흥원 축산물품질평가원 한국개발연구원 한국교통연구원 한국노동연구원 "
+            "한국법제연구원 한국보건사회연구원 한국조세재정연구원 한국직업능력개발원 한국청소년정책연구원 한국항로표지기술원 "
+            "한국해양교통안전공단 한국환경연구원",
+    "충북": "정보통신산업진흥원 정보통신정책연구원 한국가스안전공사 한국고용정보원 한국과학기술기획평가원 한국교육개발원 "
+            "한국교육과정평가원 한국보건복지인재원 한국보건산업진흥원 한국소비자원 한국식품안전관리인증원",
+    "충남": "한국생산기술연구원 한국서부발전 한국중부발전",
+}
+_LT_NORM = {n.replace(" ", ""): area for area, names in LOCAL_TALENT_AGENCIES.items() for n in names.split()}
+
+
+def _local_talent(inst):
+    """지역인재 의무채용 기관이면 소재 시도(대전/세종/충북/충남), 아니면 빈 문자열"""
+    key = re.sub(r"\(주\)|㈜|\s", "", inst or "")
+    return _LT_NORM.get(key, "")
+
+
 def _txt(v, n):
     """공고 본문 칸: 줄바꿈은 살리고 연속 공백만 정리"""
     s = str(v or "").replace("\r", "")
@@ -364,8 +388,8 @@ def _dday(x, today):
 
 
 def browse(jobs=(), subs=(), regions=(), hires=(), ses=(), q="", closing=0, sort="match",
-           page=1, size=20, career=""):
-    """필터 + 정렬 + 페이지 + 항목별 개수(facet).
+           page=1, size=20, career="", local=False):
+    """필터 + 정렬 + 페이지 + 항목별 개수(facet). local=True면 대전·충청 지역인재 의무채용 기관 공고만.
     facet 개수는 '그 항목만 빼고 나머지 필터를 걸었을 때' 개수 — 잡코리아처럼 눌렀을 때 몇 건 나올지 미리 보인다."""
     items, fetched_at, error, has_key = get_postings()
     today = date.today()
@@ -391,9 +415,12 @@ def browse(jobs=(), subs=(), regions=(), hires=(), ses=(), q="", closing=0, sort
                 return False
         if qn and qn not in (x["inst"] + " " + x["title"] + " " + x.get("qual", "")).lower():
             return False
+        if skip != "local" and local and not _local_talent(x["inst"]):
+            return False
         return True
 
     facets = {
+        "local": sum(1 for x in items if ok(x, "local") and _local_talent(x["inst"])),
         "job": {j: sum(1 for x in items if ok(x, "job") and _in_job(x, j)) for j in JOBS},
         "region": {r: sum(1 for x in items if ok(x, "region") and _in_region(x, [r])) for r in REGIONS},
         "hire": {h: sum(1 for x in items if ok(x, "hire") and _in_hire(x, [h])) for h in HIRE_GROUPS},
@@ -420,7 +447,8 @@ def browse(jobs=(), subs=(), regions=(), hires=(), ses=(), q="", closing=0, sort
             s -= 15
         sj, ss = _suggest_job(x["ncs"], jobs[0] if jobs else "", subs[0] if subs else "", ncs_want)
         rows.append((s, d, {**x, "dday": d, "suggest_job": sj, "suggest_sub": ss,
-                            "jobs": [j for j in JOBS if _in_job(x, j)][:3]}))
+                            "jobs": [j for j in JOBS if _in_job(x, j)][:3],
+                            "local_talent": _local_talent(x["inst"])}))
 
     far = 9999
     if sort == "deadline":
@@ -459,5 +487,6 @@ def detail(pid):
         if str(x.get("id")) == str(pid):
             sj, ss = _suggest_job(x["ncs"], "", "", set())
             return {**x, "dday": _dday(x, today), "suggest_job": sj, "suggest_sub": ss,
-                    "jobs": [j for j in JOBS if _in_job(x, j)]}
+                    "jobs": [j for j in JOBS if _in_job(x, j)],
+                    "local_talent": _local_talent(x["inst"])}
     return None

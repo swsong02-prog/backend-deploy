@@ -472,11 +472,11 @@ def _csv(v, n=20, m=20):
 @app.get("/api/postings/browse")
 def postings_browse(jobs: str = "", subs: str = "", regions: str = "", hires: str = "", ses: str = "",
                     q: str = "", closing: int = 0, sort: str = "match", page: int = 1, size: int = 20,
-                    career: str = ""):
-    """채용공고 탐색 화면 — 직무·세부직무·지역·고용형태·신입/경력·마감 필터 + 항목별 개수. 공개 데이터라 로그인 불필요."""
+                    career: str = "", local: int = 0):
+    """채용공고 탐색 화면 — 직무·세부직무·지역·고용형태·신입/경력·마감·지역인재 필터 + 항목별 개수. 공개 데이터라 로그인 불필요."""
     return job_postings.browse(jobs=_csv(jobs), subs=_csv(subs, 40), regions=_csv(regions),
                                hires=_csv(hires), ses=_csv(ses), q=q[:40], closing=max(0, min(closing, 60)),
-                               sort=sort[:10], page=page, size=size, career=career[:5])
+                               sort=sort[:10], page=page, size=size, career=career[:5], local=bool(local))
 
 
 @app.get("/api/postings/{pid}")
