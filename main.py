@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Header, Response
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status, Header, Response, Query
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
@@ -130,11 +130,44 @@ def _migrate_add_user_name_column(target_engine=engine):
         print(f"[마이그레이션 경고] users.name 컬럼 추가 실패 (서버는 계속 뜸): {e}")
 
 
+def _migrate_loop_columns(target_engine=engine):
+    """루프 기능(말문 트기)용 컬럼을 기존 DB에 추가한다. 실패하면 서버 기동을 중단한다(11/06 GPT 리뷰 반영).
+    - interview_sessions.mode / analysis_jobs.mode : 'normal'(기본) / 'practice'
+    - question_jobs.with_answers / answers_json   : 모범답안 생성 여부·결과"""
+    plan = {
+        "interview_sessions": {"mode": "TEXT DEFAULT 'normal'"},
+        "analysis_jobs": {"mode": "TEXT DEFAULT 'normal'"},
+        "question_jobs": {"with_answers": "INTEGER NOT NULL DEFAULT 0", "answers_json": "TEXT"},
+    }
+    try:
+        from sqlalchemy import text
+        with target_engine.begin() as conn:
+            for table, cols_needed in plan.items():
+                cols = [c[1] for c in conn.execute(text(f"PRAGMA table_info({table})")).fetchall()]
+                if not cols:
+                    continue
+                for name, ddl in cols_needed.items():
+                    if name not in cols:
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+                        print(f"[마이그레이션] {table}.{name} 컬럼 추가 완료")
+    except Exception as e:
+        # 이 컬럼들은 새 API가 바로 쓰므로, 추가에 실패하면 서버를 띄우지 않는다(조용한 반쯤 동작 방지)
+        raise RuntimeError(f"[마이그레이션 실패] 루프 기능 컬럼 추가 실패, 서버 기동 중단: {e}") from e
+    # 기동 전 스키마 확인: 필요한 컬럼이 실제로 다 있는지 다시 본다
+    from sqlalchemy import text as _t
+    with target_engine.connect() as conn:
+        for table, cols_needed in plan.items():
+            cols = [c[1] for c in conn.execute(_t(f"PRAGMA table_info({table})")).fetchall()]
+            if cols and not set(cols_needed) <= set(cols):
+                raise RuntimeError(f"[마이그레이션 실패] {table}에 {set(cols_needed) - set(cols)} 컬럼이 없음, 서버 기동 중단")
+
+
 _migrate_add_company_column()
 _migrate_add_user_name_column()
 _migrate_add_career_column()
 _migrate_question_jobs_columns()
 _migrate_add_claim_token_columns()
+_migrate_loop_columns()
 
 
 def _utc_iso(dt):
@@ -252,6 +285,7 @@ class QuestionRequest(BaseModel):
     level: str = "중"
     career: str = "신입"
     resume_text: str = ""
+    with_answers: bool = False   # 말문 트기: 모범답안(answers)도 함께 받기
 
 
 @app.get("/")
@@ -336,8 +370,11 @@ def make_questions(req: QuestionRequest,
 
     if not resume_text:
         questions = _bank_questions(job_role, req.level, req.career)
-        return {"job_role": job_role, "level": req.level, "career": req.career,
-                "questions": questions}
+        out = {"job_role": job_role, "level": req.level, "career": req.career,
+               "questions": questions}
+        if req.with_answers:
+            out["answers"] = [None] * len(questions)   # 자소서가 없으면 근거도 없음
+        return out
 
     # 자소서 기반 질문은 개인정보가 담기므로 로그인 사용자만 생성·조회할 수 있다
     user_id = _optional_user_id(authorization, db)
@@ -349,8 +386,11 @@ def make_questions(req: QuestionRequest,
     if not _worker_online():
         print("[질문] 워커 오프라인 → 자소서 질문 대신 질문은행으로 즉시 응답")
         questions = _bank_questions(job_role, req.level, req.career)
-        return {"job_role": job_role, "level": req.level, "career": req.career,
-                "questions": questions, "fallback": "worker_offline"}
+        out = {"job_role": job_role, "level": req.level, "career": req.career,
+               "questions": questions, "fallback": "worker_offline"}
+        if req.with_answers:
+            out["answers"] = [None] * len(questions)
+        return out
 
     qjob = models.QuestionJob(
         user_id=user_id,
@@ -359,6 +399,7 @@ def make_questions(req: QuestionRequest,
         level=req.level,
         career=req.career,
         resume_text=resume_text[:RESUME_MAX_TEXT_CHARS],
+        with_answers=1 if req.with_answers else 0,
         status="pending",
     )
     db.add(qjob)
@@ -387,7 +428,31 @@ def get_question_result(job_id: int,
             questions = None
     if qjob.status == "done":
         questions = _complete_questions(questions, qjob)
-    return {"status": qjob.status, "questions": questions, "error": qjob.error}
+    out = {"status": qjob.status, "questions": questions, "error": qjob.error}
+    if qjob.with_answers:
+        answers = None
+        if questions is not None:
+            try:
+                saved = json.loads(qjob.answers_json) if qjob.answers_json else None
+            except Exception:
+                saved = None
+            if not isinstance(saved, list) or len(saved) != len(questions):
+                saved = [None] * len(questions)
+            answers = saved
+        out["answers"] = answers
+    return out
+
+
+def _align_answers(final_questions, raw_questions, raw_answers, resume_text):
+    """워커가 보낸 (질문, 답안) 짝을 최종 질문 순서에 맞춘다.
+    서버에서 한 번 더 검증한다(src 원문 포함·숫자) → 어기면 null. 짝이 없는 질문(은행 보충)도 null."""
+    by_q = {}
+    if isinstance(raw_questions, list) and isinstance(raw_answers, list):
+        for q, a in zip(raw_questions, raw_answers):
+            if isinstance(q, str) and isinstance(a, dict):
+                by_q[q.strip()] = question_bank.validate_model_answer(
+                    a.get("text"), a.get("src"), resume_text or "")
+    return [by_q.get(q) for q in final_questions]
 
 
 # ════════════════════════════════════════════════════════
@@ -525,6 +590,7 @@ async def analyze_answer(
     question: str = Form(...),
     job_role: str = Form("일반 직무"),
     career: str = Form("신입"),
+    mode: str = Form("normal"),   # "practice"(말문 트기)면 워커가 내용 평가를 건너뜀
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -578,6 +644,7 @@ async def analyze_answer(
         question=question,
         job_role=job_role,
         career=career,
+        mode="practice" if mode == "practice" else "normal",
         video_path=video_path,
         status="pending",
     )
@@ -632,6 +699,7 @@ def worker_next_job(db: Session = Depends(get_db),
         "job_role": job.job_role,
         "career": job.career or "신입",
         "video_url": f"/worker/video/{job.id}",
+        **({"mode": "practice"} if job.mode == "practice" else {}),   # 일반 일감은 예전과 같은 모양
     }
 
 
@@ -751,6 +819,11 @@ def worker_post_result(job_id: int,
         for k in ("posture_score", "content_score"):
             if k in result:
                 result[k] = _clamp_score(result[k])
+        if job.mode == "practice":
+            # 말문 트기: 옛 워커가 내용 평가를 해 와도 서버에서 지운다(계약: content null, practice true)
+            result["content"] = None
+            result["content_score"] = None
+            result["practice"] = True
         values = {models.AnalysisJob.status: "done",
                   models.AnalysisJob.result_json: json.dumps(result, ensure_ascii=False, allow_nan=False),
                   models.AnalysisJob.error: None}
@@ -791,12 +864,14 @@ def worker_next_question_job(db: Session = Depends(get_db),
         "level": qjob.level or "중",
         "career": qjob.career or "신입",
         "resume_text": qjob.resume_text or "",
+        **({"with_answers": True} if qjob.with_answers else {}),   # 일반 일감은 예전과 같은 모양
     }
 
 
 class WorkerQuestionResult(BaseModel):
     ok: bool
     questions: list[str] | None = None
+    answers: list[dict | None] | None = None   # with_answers 일감일 때만 (questions와 같은 순서)
     error: str | None = None
     claim_token: str | None = None
 
@@ -815,6 +890,9 @@ def worker_post_question_result(job_id: int,
         values = {models.QuestionJob.status: "done",
                   models.QuestionJob.result_json: json.dumps(questions, ensure_ascii=False, allow_nan=False),
                   models.QuestionJob.error: None}
+        if qjob.with_answers:
+            answers = _align_answers(questions, payload.questions, payload.answers, qjob.resume_text)
+            values[models.QuestionJob.answers_json] = json.dumps(answers, ensure_ascii=False)
     else:
         values = {models.QuestionJob.status: "failed",
                   models.QuestionJob.error: payload.error or "워커에서 질문을 생성하지 못했습니다."}
@@ -924,6 +1002,7 @@ class SessionIn(BaseModel):
     company: str | None = Field(None, max_length=100)   # 지원 회사 (선택, 없거나 빈 문자열이면 null 저장)
     level: str = Field("중", max_length=10)
     career: str | None = Field(None, max_length=10)     # 신입/경력 (추천 '같은 조건' 복원용)
+    mode: str | None = Field(None, max_length=20)       # normal(기본) / practice(말문 트기)
     results: list[ResultIn] = Field(default_factory=list, max_length=30)
 
 
@@ -955,6 +1034,7 @@ def finish_interview(payload: SessionIn,
         company=company,
         career=career,
         level=payload.level,
+        mode="practice" if payload.mode == "practice" else "normal",
         posture_score=posture_avg,
         content_score=content_avg,
         total_score=total,
@@ -998,6 +1078,7 @@ def get_history(current_user: models.User = Depends(get_current_user),
         "company": s.company,
         "career": s.career,
         "level": s.level,
+        "mode": s.mode or "normal",
         "posture_score": s.posture_score,
         "content_score": s.content_score,
         "total_score": s.total_score,
@@ -1067,6 +1148,7 @@ def get_history_detail(session_id: int,
             "company": session.company,
             "career": session.career,
             "level": session.level,
+            "mode": session.mode or "normal",
             "posture_score": session.posture_score,
             "content_score": session.content_score,
             "total_score": session.total_score,
@@ -1241,3 +1323,338 @@ async def synthesize_speech(req: TTSRequest,
         _tts_cache.popitem(last=False)  # 가장 오래된 항목 제거
 
     return Response(content=audio, media_type="audio/mpeg")
+
+
+# ════════════════════════════════════════════════════════
+#  루프 기능: 목표 → 데일리 플래너 → 달성 소식 → 연속 기록·주간 퀘스트
+#  날짜는 'YYYY-MM-DD', 기준은 한국 시간(KST)
+# ════════════════════════════════════════════════════════
+KST = timezone(timedelta(hours=9))
+LOOP_TEXT_MAX = 200
+FEED_MESSAGE_MAX = 300
+
+
+def _kst_today():
+    return datetime.now(KST).date()
+
+
+def _to_kst_date(dt):
+    """DB created_at(naive UTC) → KST 날짜."""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(KST).date()
+
+
+def _check_date(value, field="date"):
+    """'YYYY-MM-DD' 형식 확인. 틀리면 400."""
+    if value is None:
+        return None
+    v = str(value).strip()
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{field}는 YYYY-MM-DD 형식이어야 해요.")
+    return v
+
+
+def _check_text(value, field, max_len=LOOP_TEXT_MAX):
+    v = " ".join(str(value or "").split())
+    if not v:
+        raise HTTPException(status_code=400, detail=f"{field}을(를) 입력해주세요.")
+    if len(v) > max_len:
+        raise HTTPException(status_code=400, detail=f"{field}은(는) {max_len}자 이내로 입력해주세요.")
+    return v
+
+
+def _mask_name(name):
+    """'나영성' → '나*성', '김철' → '김*', 이름이 없으면 '익명'."""
+    n = (name or "").strip()
+    if not n:
+        return "익명"
+    if len(n) == 1:
+        return "*"
+    if len(n) == 2:
+        return n[0] + "*"
+    return n[0] + "*" * (len(n) - 2) + n[-1]
+
+
+def _goal_out(g):
+    return {"id": g.id, "job": g.job, "title": g.title, "due_date": g.due_date,
+            "is_public": bool(g.is_public), "achieved_at": _utc_iso(g.achieved_at),
+            "created_at": _utc_iso(g.created_at)}
+
+
+def _plan_out(p):
+    return {"id": p.id, "date": p.date, "text": p.text, "done": bool(p.done), "goal_id": p.goal_id}
+
+
+def _my_goal(db, user, goal_id):
+    g = (db.query(models.Goal)
+         .filter(models.Goal.id == goal_id, models.Goal.user_id == user.user_id).first())
+    if g is None:
+        raise HTTPException(status_code=404, detail="해당 목표를 찾을 수 없습니다.")
+    return g
+
+
+def _my_plan(db, user, plan_id):
+    p = (db.query(models.PlanItem)
+         .filter(models.PlanItem.id == plan_id, models.PlanItem.user_id == user.user_id).first())
+    if p is None:
+        raise HTTPException(status_code=404, detail="해당 할 일을 찾을 수 없습니다.")
+    return p
+
+
+# ── 목표 ──
+class GoalIn(BaseModel):
+    job: str = Field(..., max_length=100)
+    title: str = Field(..., max_length=LOOP_TEXT_MAX)
+    due_date: str | None = None
+    is_public: bool = False
+
+
+class GoalPatch(BaseModel):
+    title: str | None = Field(None, max_length=LOOP_TEXT_MAX)
+    due_date: str | None = None
+    is_public: bool | None = None
+    achieved: bool | None = None
+
+
+@app.get("/goals")
+def list_goals(current_user: models.User = Depends(get_current_user),
+               db: Session = Depends(get_db)):
+    goals = (db.query(models.Goal)
+             .filter(models.Goal.user_id == current_user.user_id)
+             .order_by(models.Goal.created_at.desc(), models.Goal.id.desc()).all())
+    return [_goal_out(g) for g in goals]
+
+
+@app.post("/goals")
+def create_goal(req: GoalIn, current_user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    g = models.Goal(user_id=current_user.user_id,
+                    job=_check_text(req.job, "직무", 100),
+                    title=_check_text(req.title, "목표"),
+                    due_date=_check_date(req.due_date, "due_date") if req.due_date else None,
+                    is_public=bool(req.is_public))
+    db.add(g)
+    db.commit()
+    db.refresh(g)
+    return _goal_out(g)
+
+
+@app.patch("/goals/{goal_id}")
+def update_goal(goal_id: int, req: GoalPatch,
+                current_user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    g = _my_goal(db, current_user, goal_id)
+    sent = req.model_fields_set   # 보낸 필드만 바꾼다 (due_date: null 은 날짜 지우기)
+    if "title" in sent and req.title is not None:
+        g.title = _check_text(req.title, "목표")
+    if "due_date" in sent:
+        g.due_date = _check_date(req.due_date, "due_date") if req.due_date else None
+    if "is_public" in sent and req.is_public is not None:
+        g.is_public = bool(req.is_public)
+    if "achieved" in sent and req.achieved is not None:
+        g.achieved_at = datetime.utcnow() if req.achieved else None
+    db.commit()
+    db.refresh(g)
+    return _goal_out(g)
+
+
+@app.delete("/goals/{goal_id}")
+def delete_goal(goal_id: int, current_user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    g = _my_goal(db, current_user, goal_id)
+    # 연결된 할 일·소식은 남기고 연결만 끊는다
+    (db.query(models.PlanItem).filter(models.PlanItem.goal_id == g.id)
+     .update({models.PlanItem.goal_id: None}, synchronize_session=False))
+    (db.query(models.FeedPost).filter(models.FeedPost.goal_id == g.id)
+     .update({models.FeedPost.goal_id: None}, synchronize_session=False))
+    db.delete(g)
+    db.commit()
+    return {"ok": True, "id": goal_id}
+
+
+# ── 데일리 플래너 ──
+class PlanIn(BaseModel):
+    date: str
+    text: str = Field(..., max_length=LOOP_TEXT_MAX)
+    goal_id: int | None = None
+
+
+class PlanPatch(BaseModel):
+    text: str | None = Field(None, max_length=LOOP_TEXT_MAX)
+    done: bool | None = None
+    date: str | None = None
+
+
+@app.get("/plans")
+def list_plans(current_user: models.User = Depends(get_current_user),
+                     db: Session = Depends(get_db),
+                     from_: str | None = Query(None, alias="from"),
+                     to: str | None = None):
+    q = db.query(models.PlanItem).filter(models.PlanItem.user_id == current_user.user_id)
+    if from_:
+        q = q.filter(models.PlanItem.date >= _check_date(from_, "from"))
+    if to:
+        q = q.filter(models.PlanItem.date <= _check_date(to, "to"))
+    items = q.order_by(models.PlanItem.date.asc(), models.PlanItem.id.asc()).limit(1000).all()
+    return [_plan_out(p) for p in items]
+
+
+@app.post("/plans")
+def create_plan(req: PlanIn, current_user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    if req.goal_id is not None:
+        _my_goal(db, current_user, req.goal_id)   # 남의 목표에 붙이지 못하게
+    p = models.PlanItem(user_id=current_user.user_id,
+                        date=_check_date(req.date),
+                        text=_check_text(req.text, "할 일"),
+                        goal_id=req.goal_id, done=False)
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return _plan_out(p)
+
+
+@app.patch("/plans/{plan_id}")
+def update_plan(plan_id: int, req: PlanPatch,
+                current_user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    p = _my_plan(db, current_user, plan_id)
+    if req.text is not None:
+        p.text = _check_text(req.text, "할 일")
+    if req.done is not None:
+        p.done = bool(req.done)
+    if req.date is not None:
+        p.date = _check_date(req.date)
+    db.commit()
+    db.refresh(p)
+    return _plan_out(p)
+
+
+@app.delete("/plans/{plan_id}")
+def delete_plan(plan_id: int, current_user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    p = _my_plan(db, current_user, plan_id)
+    db.delete(p)
+    db.commit()
+    return {"ok": True, "id": plan_id}
+
+
+# ── 달성 소식 ──
+class FeedIn(BaseModel):
+    goal_id: int
+    message: str = Field(..., max_length=FEED_MESSAGE_MAX)
+
+
+def _feed_post_out(post, author_name):
+    return {"id": post.id, "author": _mask_name(author_name), "job": post.job,
+            "message": post.message, "created_at": _utc_iso(post.created_at)}
+
+
+@app.post("/feed")
+def create_feed_post(req: FeedIn, current_user: models.User = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    g = _my_goal(db, current_user, req.goal_id)
+    if g.achieved_at is None:
+        raise HTTPException(status_code=400, detail="달성한 목표에만 소식을 남길 수 있어요.")
+    post = models.FeedPost(user_id=current_user.user_id, goal_id=g.id, job=g.job,
+                           message=_check_text(req.message, "소식", FEED_MESSAGE_MAX))
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return _feed_post_out(post, current_user.name)
+
+
+@app.get("/feed")
+def get_feed(job: str = "", limit: int = 20,
+             current_user: models.User = Depends(get_current_user),
+             db: Session = Depends(get_db)):
+    limit = max(1, min(int(limit or 20), 50))
+    job = (job or "").strip()[:100]
+
+    pq = (db.query(models.FeedPost, models.User.name)
+          .join(models.User, models.User.user_id == models.FeedPost.user_id))
+    if job:
+        pq = pq.filter(models.FeedPost.job == job)
+    posts = pq.order_by(models.FeedPost.created_at.desc(), models.FeedPost.id.desc()).limit(limit).all()
+
+    gq = (db.query(models.Goal, models.User.name)
+          .join(models.User, models.User.user_id == models.Goal.user_id)
+          .filter(models.Goal.is_public == True))  # noqa: E712
+    if job:
+        gq = gq.filter(models.Goal.job == job)
+    goals = gq.order_by(models.Goal.created_at.desc(), models.Goal.id.desc()).limit(limit).all()
+
+    return {
+        "posts": [_feed_post_out(p, name) for p, name in posts],
+        "goals": [{"author": _mask_name(name), "job": g.job, "title": g.title,
+                   "due_date": g.due_date, "achieved": g.achieved_at is not None}
+                  for g, name in goals],
+    }
+
+
+# ── 연속 기록·주간 퀘스트 ──
+@app.get("/me/progress")
+def my_progress(current_user: models.User = Depends(get_current_user),
+                db: Session = Depends(get_db)):
+    today = _kst_today()
+    monday = today - timedelta(days=today.weekday())   # KST 월요일 시작
+    sunday = monday + timedelta(days=6)
+
+    sessions = (db.query(models.InterviewSession.created_at, models.InterviewSession.mode)
+                .filter(models.InterviewSession.user_id == current_user.user_id).all())
+    done_plans = (db.query(models.PlanItem.date)
+                  .filter(models.PlanItem.user_id == current_user.user_id,
+                          models.PlanItem.done == True).all())  # noqa: E712
+
+    active_days = set()
+    week_interviews = week_practice = 0
+    for created_at, mode in sessions:
+        d = _to_kst_date(created_at)
+        if d is None:
+            continue
+        active_days.add(d)
+        if monday <= d <= sunday:
+            week_interviews += 1
+            if mode == "practice":
+                week_practice += 1
+
+    week_plans_done = 0
+    for (date_str,) in done_plans:
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        active_days.add(d)
+        if monday <= d <= sunday:
+            week_plans_done += 1
+
+    # 오늘 또는 어제부터 거꾸로 이어지는 날 수
+    streak = 0
+    cursor = today if today in active_days else today - timedelta(days=1)
+    while cursor in active_days:
+        streak += 1
+        cursor -= timedelta(days=1)
+
+    def quest(key, label, current, target):
+        return {"key": key, "label": label, "current": current, "target": target,
+                "done": current >= target}
+
+    return {
+        "streak_days": streak,
+        "week": {"interviews": week_interviews, "plans_done": week_plans_done},
+        "quests": [
+            quest("interviews_3", "이번 주 면접 3회", week_interviews, 3),
+            quest("plans_5", "이번 주 할 일 5개 완료", week_plans_done, 5),
+            quest("practice_1", "말문 트기 연습 1회", week_practice, 1),
+        ],
+    }

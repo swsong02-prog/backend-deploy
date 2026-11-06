@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -5,6 +6,9 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 # 우리 창고(DB) 주소. 일단 backend 폴더 안에 파일 하나로 시작.
 # sqlite = 설치 필요 없이 파일 하나가 곧 DB. 나중에 AWS 가면 이 줄만 바꾸면 됨.
 DATABASE_URL = f"sqlite:///{Path(__file__).resolve().parent / 'coachcoach.db'}"
+# 로컬 테스트용: COACHCOACH_DB_PATH 를 주면 그 파일을 쓴다(실서버 DB를 건드리지 않게). 없으면 위 기본값 그대로.
+if os.environ.get("COACHCOACH_DB_PATH", "").strip():
+    DATABASE_URL = f"sqlite:///{Path(os.environ['COACHCOACH_DB_PATH'].strip()).resolve()}"
 
 # 엔진 = DB로 들어가는 '문'. sqlite는 한 가지 옵션이 더 필요해서 connect_args를 붙임.
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False, "timeout": 10})

@@ -875,8 +875,104 @@ def read_resume(path: str) -> str:
         return ""
 
 
+# ════════════════════════════════════════════════════════
+#  말문 트기용 모범답안 검증
+#  규칙: 자소서에 적힌 사실만. 하나라도 어기면 그 답안은 None(화면엔 "쓸 경험이 없습니다").
+#   ① src(근거 문장)가 자소서 원문에 그대로 있어야 함(공백·따옴표 차이만 허용)
+#   ② 답안 속 숫자가 전부 자소서에 있어야 함(지어낸 수치 금지)
+#   ③ 한자·가나·누출 흔적 없음, 길이 정상
+# ════════════════════════════════════════════════════════
+_NUM_PATTERN = re.compile(r"\d+(?:[.,]\d+)*")
+_ANSWER_LEAK = re.compile(r"[{}\[\]`<>]|json|\\n|http", re.IGNORECASE)
+
+
+def _norm_space(t: str) -> str:
+    t = re.sub(r"[“”‘’\"']", "", str(t or ""))
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _numbers_in(t: str) -> set:
+    return {n.replace(",", "") for n in _NUM_PATTERN.findall(str(t or ""))}
+
+
+def validate_model_answer(answer, src, resume_text: str):
+    """검증을 통과하면 {"text", "src"}, 아니면 None."""
+    if not isinstance(answer, str) or not isinstance(src, str):
+        return None
+    text = re.sub(r"\s+", " ", answer).strip()
+    src_clean = _norm_space(src).strip(" .")
+    resume_norm = _norm_space(resume_text)
+    if len(text) < 30 or len(text) > 700 or len(src_clean) < 8:
+        return None
+    if _CJK_PATTERN.search(text) or _ANSWER_LEAK.search(text):
+        return None
+    if src_clean not in resume_norm:                       # ① 근거 문장이 원문에 없음
+        return None
+    if not _numbers_in(text) <= _numbers_in(resume_text):  # ② 자소서에 없는 숫자
+        return None
+    text = _keep_grounded_sentences(text, resume_norm)     # ④ 자소서 근거가 약한 문장은 뺌
+    if len(text) < 30:
+        return None
+    return {"text": text, "src": src_clean}
+
+
+# ④ 문장 단위 근거 검사: 문장의 내용어 가운데 자소서에 나오는 비율이 낮으면 그 문장을 뺀다.
+#    숫자 없는 과장("문서화 능력이 탁월하여")이나 자소서에 없는 인과를 덧붙인 문장을 걸러 내기 위함.
+#    형태소 분석기 없이, 단어 앞 2글자 이상이 자소서에 나오면 "근거 있음"으로 본다.
+_GENERIC_WORDS = {"저는", "제가", "저의", "이를", "통해", "위해", "그래서", "그리고", "또한", "이러한", "경험", "경험을",
+                  "경험이", "생각합니다", "있습니다", "했습니다", "합니다", "되었습니다", "하였습니다", "있었습니다", "바탕으로",
+                  "앞으로", "이후", "당시", "가장", "많은", "기여하고", "싶습니다", "배웠습니다", "느꼈습니다"}
+_GROUND_RATIO = 0.6
+
+
+def _content_words(sentence: str) -> list:
+    words = re.sub(r"[^\w\s]", " ", sentence).split()
+    return [w for w in words if len(w) >= 2 and w not in _GENERIC_WORDS]
+
+
+def _word_in_resume(word: str, resume_norm: str) -> bool:
+    for n in range(len(word), 1, -1):          # 조사·어미가 붙어도 앞부분이 자소서에 있으면 인정
+        if word[:n] in resume_norm:
+            return True
+    return False
+
+
+def _keep_grounded_sentences(text: str, resume_norm: str) -> str:
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    kept = []
+    for s in sentences:
+        words = _content_words(s)
+        if not words:
+            continue
+        hit = sum(1 for w in words if _word_in_resume(w, resume_norm))
+        if hit / len(words) >= _GROUND_RATIO:
+            kept.append(s)
+    return " ".join(kept)
+
+
+def _answer_prompt_block(with_answers: bool) -> tuple:
+    """with_answers일 때 프롬프트에 붙일 규칙과 출력 형식."""
+    if not with_answers:
+        return "", '{"questions": ["질문1", "질문2", "질문3", "질문4"]}'
+    rules = """
+[모범답안 규칙]
+- 각 질문마다 지원자가 실제로 말할 모범답안(answer)과 근거 문장(src)을 함께 씁니다.
+- 모범답안은 자기소개서에 적힌 사실만 사용합니다. 자소서에 없는 경험·숫자·회사명·기간을 지어내지 마세요.
+- 숫자는 자소서에 적힌 숫자만 그대로 씁니다.
+- 3~5문장, 면접에서 말하기 좋은 자연스러운 구어체 '~습니다/~합니다'체로 씁니다.
+- src에는 답안의 근거가 된 자기소개서 문장 하나를 글자 그대로 복사해 넣습니다.
+- 자소서에 쓸 만한 경험이 없으면 answer와 src를 빈 문자열로 둡니다.
+- intro는 '간단하게 자기소개를 해주세요.', motive는 '지원 동기' 질문에 대한 답안입니다."""
+    fmt = ('{"intro": {"answer": "답안", "src": "자소서 원문 문장"}, '
+           '"motive": {"answer": "답안", "src": "자소서 원문 문장"}, '
+           '"questions": [{"q": "질문1", "answer": "답안", "src": "자소서 원문 문장"}, ...]}')
+    return rules, fmt
+
+
 def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int,
-                          is_career: bool = False):
+                          is_career: bool = False, with_answers: bool = False):
+    """with_answers=False → 질문 리스트(기존과 동일) 또는 None.
+    with_answers=True  → (질문 리스트, 답안 리스트) 또는 None. 답안 원소는 {"text","src"} 또는 None."""
     try:
         import ollama
     except Exception:
@@ -898,6 +994,7 @@ def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int,
         )
     else:
         career_hint = ""
+    answer_rules, out_format = _answer_prompt_block(with_answers)
     prompt = f"""당신은 '{job_role}' 직무의 면접관입니다. 아래는 지원자가 제출한 자기소개서입니다.
 이 자소서 내용을 근거로, 실제 면접관이 물어볼 법한 맞춤 면접 질문 {need}개를 만들어 주세요.{career_hint}
 
@@ -908,10 +1005,10 @@ def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int,
 {_LANGUAGE_RULES}
 - 자소서에 실제로 적힌 경험·역량을 구체적으로 파고드는 질문으로 만듭니다.
 - 난이도는 '{level}'({level_hint})에 맞춥니다.
-- 자기소개·지원동기처럼 일반 질문은 제외합니다.
+- 자기소개·지원동기처럼 일반 질문은 제외합니다.{answer_rules}
 - 아래 JSON 형식 하나만 출력하세요. 다른 텍스트 금지.
 
-{{"questions": ["질문1", "질문2", "질문3", "질문4"]}}"""
+{out_format}"""
     try:
         resp = ollama.chat(
             model="qwen2.5:7b",
@@ -923,35 +1020,74 @@ def _generate_from_resume(resume_text: str, job_role: str, level: str, n: int,
                 {"role": "user", "content": prompt},
             ],
             format="json",
-            options={"temperature": 0.7},
+            options={"temperature": 0.4 if with_answers else 0.7},
         )
         content = resp["message"]["content"]
         start, end = content.find("{"), content.rfind("}")
         data = json.loads(content[start:end + 1])
-        qs = [str(q).strip() for q in data.get("questions", []) if str(q).strip()]
+        raw = data.get("questions", []) or []
+        if not with_answers:
+            qs = [str(q).strip() for q in raw if str(q).strip()]
+            if not qs:
+                return None
+            # ★ 검증 게이트: 외국어·누출·반말·중복 드롭 후 정적 은행으로 보충해 n개 보장
+            return _finalize_questions(qs, n, job_role, level, is_career)
+
+        # with_answers: 질문별 답안을 검증해 두고, 최종 질문 순서에 맞춰 붙인다
+        qs, by_key = [], {}
+        for item in raw:
+            if isinstance(item, str):
+                q, ans, src = item, None, None
+            elif isinstance(item, dict):
+                q, ans, src = item.get("q") or item.get("question"), item.get("answer"), item.get("src")
+            else:
+                continue
+            q = str(q or "").strip()
+            if not q:
+                continue
+            qs.append(q)
+            clean = _sanitize_questions([q])
+            if clean:
+                by_key[_dedupe_key(clean[0])] = validate_model_answer(ans, src, resume_text)
         if not qs:
             return None
-        # ★ 검증 게이트: 외국어·누출·반말·중복 드롭 후 정적 은행으로 보충해 n개 보장
-        return _finalize_questions(qs, n, job_role, level, is_career)
+        for fixed_q, key in ((INTRO_QUESTION, "intro"), (MOTIVE_QUESTION, "motive")):
+            blk = data.get(key) if isinstance(data.get(key), dict) else {}
+            by_key[_dedupe_key(fixed_q)] = validate_model_answer(
+                blk.get("answer"), blk.get("src"), resume_text)
+        questions = _finalize_questions(qs, n, job_role, level, is_career)
+        answers = [by_key.get(_dedupe_key(q)) for q in questions]  # 은행 보충 질문은 None
+        kept = sum(a is not None for a in answers)
+        print(f"[모범답안] {len(answers)}개 중 {kept}개 검증 통과(나머지는 근거 없음 → null).")
+        return questions, answers
     except Exception as e:
         print(f"[자소서] 질문 생성 실패 → 일반 질문으로 진행합니다. (사유: {e})")
         return None
 
 
 def build_questions_from_resume(resume_text: str, job_role: str = "일반 직무",
-                                level: str = "중", n: int = 6, career: str = "신입"):
+                                level: str = "중", n: int = 6, career: str = "신입",
+                                with_answers: bool = False):
+    """with_answers=False(기본) → 질문 리스트 (기존과 동일).
+    with_answers=True → (질문 리스트, 답안 리스트). 질문은행으로 대체되면 답안은 전부 None."""
     level = _normalize_level(level)
     is_career = str(career).strip() in ("경력", "경력자", "career")
     if resume_text and resume_text.strip():
         ctx = "경력자" if is_career else "신입"
         print(f"[질문] 자소서를 분석해 맞춤 질문({ctx})을 생성 중입니다...")
-        qs = _generate_from_resume(resume_text, job_role, level, n,
-                                   is_career=is_career)
-        if qs:
+        got = _generate_from_resume(resume_text, job_role, level, n,
+                                    is_career=is_career, with_answers=with_answers)
+        if got:
             print("[질문] 자소서 기반 맞춤 질문을 생성했습니다.")
-            return qs[:n]
+            if with_answers:
+                qs, answers = got
+                return qs[:n], answers[:n]
+            return got[:n]
     print("[질문] 자소서 질문 생성을 건너뛰고 일반 질문으로 진행합니다.")
-    return build_questions(job_role=job_role, level=level, n=n, career=career)
+    qs = build_questions(job_role=job_role, level=level, n=n, career=career)
+    if with_answers:
+        return qs, [None] * len(qs)
+    return qs
 
 
 def build_questions(job_role: str = "일반 직무", level: str = "중",

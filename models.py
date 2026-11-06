@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -33,6 +33,7 @@ class InterviewSession(Base):
     posture_score = Column(Integer)                                  # 자세·표정 종합 점수
     content_score = Column(Integer)                                  # 답변 내용 종합 점수
     total_score = Column(Integer)                                    # 종합 점수
+    mode = Column(String, default="normal", server_default="normal")  # normal(실전) / practice(말문 트기)
     created_at = Column(DateTime(timezone=True), server_default=func.now())  # 면접 본 일시
 
     # 위로는 회원, 아래로는 문항 결과들과 연결
@@ -49,6 +50,7 @@ class AnalysisJob(Base):
     question = Column(Text)                                   # 면접 질문
     job_role = Column(String)                                 # 직무 (예: 개발 백엔드)
     career = Column(String, default="신입")                    # 신입/경력 구분 (워커 평가 프롬프트 분기용)
+    mode = Column(String, default="normal", server_default="normal")  # practice면 내용 평가 생략
     video_path = Column(String)                               # 서버 디스크에 저장된 영상 경로
     status = Column(String, default="pending", index=True)    # pending / processing / done / failed
     result_json = Column(Text, nullable=True)                 # 워커가 보낸 분석 결과(JSON 문자열)
@@ -70,6 +72,8 @@ class QuestionJob(Base):
     level = Column(String, default="중")                       # 난이도 (하/중/상)
     career = Column(String, default="신입")                    # 신입/경력 구분
     resume_text = Column(Text)                                # 자소서 본문
+    with_answers = Column(Integer, nullable=False, default=0, server_default="0")  # 1이면 모범답안도 생성(말문 트기)
+    answers_json = Column(Text, nullable=True)                # 모범답안 배열(JSON, questions와 같은 순서)
     status = Column(String, default="pending", index=True)    # pending / processing / done / failed
     result_json = Column(Text, nullable=True)                 # 워커가 보낸 질문 리스트(JSON 문자열)
     error = Column(Text, nullable=True)                       # 실패 시 오류 메시지
@@ -96,3 +100,40 @@ class QuestionResult(Base):
 
     # 위로 세션과 연결
     session = relationship("InterviewSession", back_populates="results")
+
+
+# ── 루프 기능: 목표 → 데일리 플래너 → 달성 소식 ──
+class Goal(Base):
+    __tablename__ = "goals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.user_id"), index=True)
+    job = Column(String)                                      # 직무 (같은 직무 소식·공개 목표 묶음 기준)
+    title = Column(String)                                    # 목표 제목
+    due_date = Column(String, nullable=True)                  # 'YYYY-MM-DD' (KST)
+    is_public = Column(Boolean, nullable=False, default=False, server_default="0")
+    achieved_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PlanItem(Base):
+    __tablename__ = "plan_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.user_id"), index=True)
+    date = Column(String, index=True)                         # 'YYYY-MM-DD' (KST)
+    text = Column(String)
+    done = Column(Boolean, nullable=False, default=False, server_default="0")
+    goal_id = Column(Integer, ForeignKey("goals.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class FeedPost(Base):
+    __tablename__ = "feed_posts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.user_id"), index=True)
+    goal_id = Column(Integer, ForeignKey("goals.id"), nullable=True)
+    job = Column(String, index=True)
+    message = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
