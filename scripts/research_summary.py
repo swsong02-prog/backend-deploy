@@ -71,7 +71,9 @@ def main():
         })
 
     calm = []
-    for c in con.execute("SELECT user_id, session_id, pre, post, challenge, breath_sec, created_at FROM calm_logs"):
+    has_kind = "kind" in {r[1] for r in con.execute("PRAGMA table_info(calm_logs)")}
+    kind_col = "kind" if has_kind else "'full' AS kind"
+    for c in con.execute(f"SELECT user_id, session_id, {kind_col}, pre, post, challenge, breath_sec, created_at FROM calm_logs"):
         if not ok_user(c["user_id"]) or (since and (c["created_at"] or "") < since):
             continue
         calm.append(dict(c))
@@ -91,6 +93,10 @@ def main():
         "올라간 비율(%)": pct(sum(d > 0 for d in diffs), len(diffs)),
         "호흡 1분 이상 한 경우 평균 변화": r1(safe_mean(breathed)), "호흡 건너뛴 경우 평균 변화": r1(safe_mean(skipped)),
         "위협(1)~도전(7) 평균": r1(safe_mean(c["challenge"] for c in calm)),
+        "전체 6분 평균 변화(수)": (r1(safe_mean(c["post"] - c["pre"] for c in pairs if (c["kind"] or "full") == "full")),
+                            sum((c["kind"] or "full") == "full" for c in pairs)),
+        "1분 버전 평균 변화(수)": (r1(safe_mean(c["post"] - c["pre"] for c in pairs if c["kind"] == "short")),
+                             sum(c["kind"] == "short" for c in pairs)),
     }
 
     # 2, 3. 같은 사람의 첫 면접과 최근 면접

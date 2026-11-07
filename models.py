@@ -148,6 +148,7 @@ class CalmLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.user_id"), index=True)
     session_id = Column(Integer, ForeignKey("interview_sessions.session_id"), nullable=True)  # 이 루틴 뒤에 본 면접
+    kind = Column(String, nullable=True)        # full(약 6분) / short(1분 호흡만)
     pre = Column(Integer, nullable=True)        # 루틴 전 긴장 0~10
     post = Column(Integer, nullable=True)       # 루틴 후 긴장 0~10
     challenge = Column(Integer, nullable=True)  # 위협(1)~도전(7)

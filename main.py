@@ -139,6 +139,7 @@ def _migrate_loop_columns(target_engine=engine):
         "analysis_jobs": {"mode": "TEXT DEFAULT 'normal'"},
         "question_jobs": {"with_answers": "INTEGER NOT NULL DEFAULT 0", "answers_json": "TEXT"},
         "question_results": {"first_voice_ms": "INTEGER"},  # 11/07 효과 측정: 첫 마디까지 걸린 시간
+        "calm_logs": {"kind": "TEXT"},                       # 11/07 루틴 종류: full / short
     }
     try:
         from sqlalchemy import text
@@ -1677,6 +1678,7 @@ def my_progress(current_user: models.User = Depends(get_current_user),
 #  이름·자기대화 문장은 받지 않는다. 숫자와 고른 큐만 저장한다.
 # ════════════════════════════════════════════════════════
 class CalmLogIn(BaseModel):
+    kind: str | None = Field(None, max_length=10)
     pre: int | None = Field(None, ge=0, le=10)
     post: int | None = Field(None, ge=0, le=10)
     challenge: int | None = Field(None, ge=1, le=7)
@@ -1688,7 +1690,8 @@ class CalmLogIn(BaseModel):
 def create_calm_log(req: CalmLogIn, current_user: models.User = Depends(get_current_user),
                     db: Session = Depends(get_db)):
     cues = [str(c)[:40] for c in req.cues][:4]
-    log = models.CalmLog(user_id=current_user.user_id, pre=req.pre, post=req.post,
+    kind = req.kind if req.kind in ("full", "short") else "full"
+    log = models.CalmLog(user_id=current_user.user_id, kind=kind, pre=req.pre, post=req.post,
                          challenge=req.challenge, breath_sec=req.breath_sec,
                          cues=json.dumps(cues, ensure_ascii=False))
     db.add(log)
