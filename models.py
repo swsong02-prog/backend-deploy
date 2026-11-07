@@ -97,6 +97,7 @@ class QuestionResult(Base):
     model_answer = Column(Text)       # AI 생성 모범답안
     duration_sec = Column(Integer)    # 답변 길이(초)
     filler_count = Column(Integer)    # 군더더기 말 횟수
+    first_voice_ms = Column(Integer, nullable=True)  # 녹화 시작부터 첫 마디까지 걸린 시간(ms), 측정 못 하면 null
 
     # 위로 세션과 연결
     session = relationship("InterviewSession", back_populates="results")
@@ -136,4 +137,20 @@ class FeedPost(Base):
     goal_id = Column(Integer, ForeignKey("goals.id"), nullable=True)
     job = Column(String, index=True)
     message = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ── 효과 측정: 긴장 풀기 루틴 전후 점수 (11/07) ──
+# 이름·답변 내용은 저장하지 않는다. 통계는 scripts/research_summary.py로 평균만 뽑는다.
+class CalmLog(Base):
+    __tablename__ = "calm_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.user_id"), index=True)
+    session_id = Column(Integer, ForeignKey("interview_sessions.session_id"), nullable=True)  # 이 루틴 뒤에 본 면접
+    pre = Column(Integer, nullable=True)        # 루틴 전 긴장 0~10
+    post = Column(Integer, nullable=True)       # 루틴 후 긴장 0~10
+    challenge = Column(Integer, nullable=True)  # 위협(1)~도전(7)
+    breath_sec = Column(Integer, nullable=True) # 실제 호흡한 초 (건너뛰면 0)
+    cues = Column(Text, nullable=True)          # 고른 큐(JSON 배열)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

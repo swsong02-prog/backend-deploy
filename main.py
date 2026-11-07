@@ -138,6 +138,7 @@ def _migrate_loop_columns(target_engine=engine):
         "interview_sessions": {"mode": "TEXT DEFAULT 'normal'"},
         "analysis_jobs": {"mode": "TEXT DEFAULT 'normal'"},
         "question_jobs": {"with_answers": "INTEGER NOT NULL DEFAULT 0", "answers_json": "TEXT"},
+        "question_results": {"first_voice_ms": "INTEGER"},  # 11/07 효과 측정: 첫 마디까지 걸린 시간
     }
     try:
         from sqlalchemy import text
@@ -995,6 +996,7 @@ class ResultIn(BaseModel):
     model_answer: str = Field("", max_length=20000)
     duration_sec: int = Field(0, ge=0, le=36000)
     filler_count: int = Field(0, ge=0, le=10000)
+    first_voice_ms: int | None = Field(None, ge=0, le=600000)  # 첫 마디까지(ms), 옛 화면은 보내지 않음
 
 class SessionIn(BaseModel):
     job: str = Field("", max_length=100)
@@ -1004,6 +1006,7 @@ class SessionIn(BaseModel):
     career: str | None = Field(None, max_length=10)     # 신입/경력 (추천 '같은 조건' 복원용)
     mode: str | None = Field(None, max_length=20)       # normal(기본) / practice(말문 트기)
     results: list[ResultIn] = Field(default_factory=list, max_length=30)
+    calm_log_id: int | None = None                       # 이 면접 전에 마친 긴장 풀기 루틴 기록
 
 
 def _avg(values):
@@ -1053,7 +1056,15 @@ def finish_interview(payload: SessionIn,
             model_answer=r.model_answer,
             duration_sec=r.duration_sec,
             filler_count=r.filler_count,
+            first_voice_ms=r.first_voice_ms,
         ))
+    # 면접 전에 마친 루틴 기록과 연결 (내 기록이고 아직 연결 안 된 것만)
+    if payload.calm_log_id:
+        cl = db.query(models.CalmLog).filter(models.CalmLog.id == payload.calm_log_id,
+                                             models.CalmLog.user_id == current_user.user_id,
+                                             models.CalmLog.session_id.is_(None)).first()
+        if cl:
+            cl.session_id = session.session_id
     db.commit()
 
     return {"message": "면접 기록 저장 완료",
@@ -1658,3 +1669,29 @@ def my_progress(current_user: models.User = Depends(get_current_user),
             quest("practice_1", "말문 트기 연습 1회", week_practice, 1),
         ],
     }
+
+
+
+# ════════════════════════════════════════════════════════
+#  효과 측정: 긴장 풀기 루틴 전후 점수 저장 (11/07)
+#  이름·자기대화 문장은 받지 않는다. 숫자와 고른 큐만 저장한다.
+# ════════════════════════════════════════════════════════
+class CalmLogIn(BaseModel):
+    pre: int | None = Field(None, ge=0, le=10)
+    post: int | None = Field(None, ge=0, le=10)
+    challenge: int | None = Field(None, ge=1, le=7)
+    breath_sec: int | None = Field(None, ge=0, le=600)
+    cues: list[str] = Field(default_factory=list, max_length=4)
+
+
+@app.post("/me/calm-logs")
+def create_calm_log(req: CalmLogIn, current_user: models.User = Depends(get_current_user),
+                    db: Session = Depends(get_db)):
+    cues = [str(c)[:40] for c in req.cues][:4]
+    log = models.CalmLog(user_id=current_user.user_id, pre=req.pre, post=req.post,
+                         challenge=req.challenge, breath_sec=req.breath_sec,
+                         cues=json.dumps(cues, ensure_ascii=False))
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return {"id": log.id}
